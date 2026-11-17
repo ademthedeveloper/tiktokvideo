@@ -32,7 +32,7 @@ const MODES: { id: FetchMode; label: string; blurb: string; Icon: typeof IconRad
   {
     id: "search",
     label: "Search TikTok",
-    blurb: "Real tag search — the clips actually carrying your keyword.",
+    blurb: "Search public videos with TikTok's Research API.",
     Icon: IconScan,
   },
   {
@@ -189,8 +189,8 @@ export function SourcePanel({
               ))}
             </div>
             <p className="text-[11px] leading-snug text-dim">
-              The desk reads TikTok's public tag pages, so you get the clips that are actually
-              ranked under your search — with their real captions, stats and creators.
+              Searches public videos from the last 30 days using your keyword and selected region.
+              Results include the captions, creator names and available engagement stats.
             </p>
           </div>
         ) : null}

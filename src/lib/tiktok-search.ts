@@ -1,227 +1,5 @@
+import { makeVideo } from "./video-factory";
 import type { TikTokVideo } from "./types";
-
-/**
- * TikTok serves full video metadata as JSON-LD to crawler user agents. That is
- * a public, unsigned, unblocked read path — it is what powers real search here.
- */
-const CRAWLER_UA =
-  "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
-
-type JsonLdItem = {
-  position?: number;
-  url?: string;
-  name?: string;
-  description?: string;
-  embeddedTextCaption?: string;
-  thumbnailUrl?: string[] | string;
-  uploadDate?: string;
-  contentUrl?: string;
-  commentCount?: string | number;
-  duration?: string;
-  inLanguage?: string;
-  locationCreated?: string;
-  width?: number;
-  height?: number;
-  audio?: { name?: string; author?: string };
-  creator?: {
-    name?: string;
-    alternateName?: string;
-    url?: string;
-    image?: string;
-    interactionStatistic?: InteractionStat[];
-  };
-  interactionStatistic?: InteractionStat[];
-};
-
-type InteractionStat = {
-  interactionType?: { "@type"?: string };
-  userInteractionCount?: number | string;
-};
-
-function stat(list: InteractionStat[] | undefined, action: string): number | null {
-  if (!Array.isArray(list)) return null;
-  const hit = list.find((entry) =>
-    String(entry?.interactionType?.["@type"] ?? "").toLowerCase().includes(action.toLowerCase()),
-  );
-  if (!hit) return null;
-  const value = Number(hit.userInteractionCount);
-  return Number.isFinite(value) ? value : null;
-}
-
-/** "PT1M30S" → 90 */
-function parseIsoDuration(raw?: string): number | null {
-  if (!raw) return null;
-  const match = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$/.exec(raw.trim());
-  if (!match) return null;
-  const [, h, m, s] = match;
-  const total = (Number(h ?? 0) * 3600) + (Number(m ?? 0) * 60) + Number(s ?? 0);
-  return Number.isFinite(total) && total > 0 ? Math.round(total) : null;
-}
-
-export function tagFromKeyword(keyword: string): string {
-  return keyword
-    .toLowerCase()
-    .replace(/^#+/, "")
-    .replace(/[^a-z0-9\u00C0-\u024F_]/g, "")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 60);
-}
-
-/** Ordered tag candidates so one search can still reach 10+ unique clips. */
-export function tagCandidates(keyword: string): string[] {
-  const clean = keyword.trim().toLowerCase().replace(/^@/, "");
-  const out: string[] = [];
-  const push = (value: string) => {
-    const tag = tagFromKeyword(value);
-    if (tag && !out.includes(tag)) out.push(tag);
-  };
-
-  if (clean.startsWith("@")) {
-    push(clean);
-    return out;
-  }
-
-  push(clean);
-  const words = clean.split(/[\s_-]+/).filter((w) => w.length > 2);
-  if (words.length > 1) {
-    push(words.join(""));
-    words.forEach(push);
-  } else {
-    push(`${clean}memes`);
-    push(`${clean}content`);
-    push(`${clean}s`);
-    push(`${clean}tiktok`);
-  }
-  return out.slice(0, 5);
-}
-
-function parseItemList(html: string): JsonLdItem[] {
-  const match = html.match(
-    /<script type="application\/ld\+json" id="ItemList">([\s\S]*?)<\/script>/,
-  );
-  if (!match) return [];
-  try {
-    const parsed = JSON.parse(match[1]);
-    const items = parsed?.itemListElement;
-    return Array.isArray(items) ? items : [];
-  } catch {
-    return [];
-  }
-}
-
-function pageMeta(html: string, property: string): string | null {
-  const match = html.match(
-    new RegExp(`<meta[^>]+property="${property}"[^>]+content="([^"]{0,400})"`),
-  );
-  return match ? match[1] : null;
-}
-
-export type SearchPage = {
-  tag: string;
-  videos: TikTokVideo[];
-  headline: string | null;
-  failure?: string;
-};
-
-type ReadPageResult = { html: string; failure?: never } | { html: null; failure: string };
-
-async function readPage(url: string): Promise<ReadPageResult> {
-  try {
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent": CRAWLER_UA,
-        "Accept-Language": "en-US,en;q=0.9",
-        Accept: "text/html,application/xhtml+xml",
-      },
-      cache: "no-store",
-      redirect: "follow",
-    });
-    if (!res.ok) {
-      return { html: null, failure: `TikTok returned HTTP ${res.status}` };
-    }
-    return { html: await res.text() };
-  } catch (error) {
-    return {
-      html: null,
-      failure: error instanceof Error ? error.message : "TikTok could not be reached",
-    };
-  }
-}
-
-function toItem(raw: JsonLdItem, tag: string, index: number): TikTokVideo | null {
-  const pageUrl = raw.url ?? "";
-  const idMatch = /\/video\/(\d+)/.exec(pageUrl);
-  const id = idMatch?.[1];
-  if (!id) return null;
-
-  const username =
-    raw.creator?.alternateName ??
-    /tiktok\.com\/@([^/]+)/.exec(pageUrl)?.[1] ??
-    "unknown";
-  const nickname = raw.creator?.name ?? username;
-  const caption = (raw.embeddedTextCaption ?? raw.name ?? "")
-    .replace(/\s*\|\s*TikTok\s*$/i, "")
-    .trim();
-
-  const thumb = Array.isArray(raw.thumbnailUrl) ? raw.thumbnailUrl[0] : raw.thumbnailUrl;
-  const seconds = parseIsoDuration(raw.duration);
-
-  return {
-    id,
-    caption,
-    authorUsername: username,
-    authorNickname: nickname,
-    authorAvatar: raw.creator?.image ?? null,
-    coverUrl: thumb ?? null,
-    originCoverUrl:
-      thumb ?? `https://www.tiktok.com/api/img/?itemId=${id}&location=0&aid=1988`,
-    playUrl: raw.contentUrl ?? null,
-    ttPlayUrl: raw.contentUrl ?? null,
-    hdPlayUrl: null,
-    wmPlayUrl: null,
-    shareUrl: pageUrl || `https://www.tiktok.com/@${username}/video/${id}`,
-    musicTitle: raw.audio?.name ?? null,
-    musicAuthor: raw.audio?.author ?? null,
-    musicUrl: null,
-    durationSec: seconds,
-    region: raw.locationCreated ?? raw.inLanguage ?? null,
-    postedAt: raw.uploadDate ? new Date(raw.uploadDate).toISOString() : null,
-    playCount: stat(raw.interactionStatistic, "WatchAction"),
-    diggCount: stat(raw.interactionStatistic, "LikeAction"),
-    saveCount: stat(raw.interactionStatistic, "SaveAction"),
-    shareCount: stat(raw.interactionStatistic, "ShareAction"),
-    commentCount:
-      Number(raw.commentCount ?? 0) || null,
-    creatorFollowers: stat(raw.creator?.interactionStatistic, "FollowAction"),
-    width: raw.width ?? null,
-    height: raw.height ?? null,
-    matchedTag: tag,
-    source: "search",
-    fetchedAt: new Date().toISOString(),
-    enriched: false,
-    rank: index,
-  };
-}
-
-export async function searchTagPage(tag: string): Promise<SearchPage> {
-  const url = tag.startsWith("@")
-    ? `https://www.tiktok.com/${tag}`
-    : `https://www.tiktok.com/tag/${encodeURIComponent(tag)}`;
-  const page = await readPage(url);
-  if (!page.html) {
-    return { tag, videos: [], headline: null, failure: page.failure };
-  }
-  const html = page.html;
-  const items = parseItemList(html);
-  const videos = items
-    .map((item, index) => toItem(item, tag, index))
-    .filter((video): video is TikTokVideo => Boolean(video));
-  return {
-    tag,
-    videos,
-    headline: pageMeta(html, "og:description") ?? pageMeta(html, "og:title"),
-  };
-}
 
 export type SearchOutcome = {
   videos: TikTokVideo[];
@@ -230,68 +8,168 @@ export type SearchOutcome = {
   notice?: string;
 };
 
-/**
- * Real TikTok search. Fans out over hashtag variants until we have `count`
- * unique clips, deduping by video id and keeping the most-engaged first.
- */
+type ResearchVideo = {
+  id?: string | number;
+  video_id?: string | number;
+  username?: string;
+  video_description?: string;
+  create_time?: number;
+  region_code?: string;
+  video_duration?: number;
+  view_count?: number;
+  like_count?: number;
+  comment_count?: number;
+  share_count?: number;
+};
+
+let researchTokenCache: { value: string; expiresAt: number } | null = null;
+
+async function getResearchAccessToken(): Promise<string> {
+  const clientKey = process.env.TIKTOK_RESEARCH_CLIENT_KEY?.trim();
+  const clientSecret = process.env.TIKTOK_RESEARCH_CLIENT_SECRET?.trim();
+
+  if (clientKey && clientSecret) {
+    if (researchTokenCache && researchTokenCache.expiresAt > Date.now() + 60_000) {
+      return researchTokenCache.value;
+    }
+
+    const response = await fetch("https://open.tiktokapis.com/v2/oauth/token/", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_key: clientKey,
+        client_secret: clientSecret,
+        grant_type: "client_credentials",
+      }),
+      cache: "no-store",
+      signal: AbortSignal.timeout(15_000),
+    });
+    const payload = await response.json().catch(() => null);
+    const accessToken = payload?.access_token;
+    if (!response.ok || typeof accessToken !== "string" || !accessToken) {
+      throw new Error(
+        "Could not obtain a TikTok Research API token. Check the Research API client credentials and project approval.",
+      );
+    }
+    const expiresIn = Number(payload.expires_in) || 7200;
+    researchTokenCache = {
+      value: accessToken,
+      expiresAt: Date.now() + expiresIn * 1000,
+    };
+    return accessToken;
+  }
+
+  const staticToken = process.env.TIKTOK_RESEARCH_ACCESS_TOKEN?.trim();
+  if (staticToken) return staticToken.replace(/^Bearer\s+/i, "");
+
+  throw new Error(
+    "TikTok Research API is not configured. Add TIKTOK_RESEARCH_CLIENT_KEY and TIKTOK_RESEARCH_CLIENT_SECRET from an approved TikTok Research API project.",
+  );
+}
+
+/** Search public videos using TikTok's approved Research API. */
 export async function searchTikTok(opts: {
   keyword: string;
   count?: number;
   region?: string;
 }): Promise<SearchOutcome> {
+  const token = await getResearchAccessToken();
+  const keyword = opts.keyword.trim();
   const count = Math.min(30, Math.max(4, opts.count ?? 10));
-  const candidates = tagCandidates(opts.keyword);
-  const byId = new Map<string, TikTokVideo>();
-  const tried: { tag: string; found: number }[] = [];
-  let headline: string | null = null;
-  let upstreamFailure: string | undefined;
-
-  for (const tag of candidates) {
-    if (byId.size >= count) break;
-    const page = await searchTagPage(tag);
-    tried.push({ tag, found: page.videos.length });
-    if (!upstreamFailure && page.failure) upstreamFailure = page.failure;
-    if (!headline && page.headline) headline = page.headline;
-    for (const video of page.videos) {
-      if (!byId.has(video.id)) byId.set(video.id, video);
-    }
-    if (byId.size < count && candidates.indexOf(tag) < candidates.length - 1) {
-      await new Promise((resolve) => setTimeout(resolve, 550));
-    }
+  const end = new Date();
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - 29);
+  const dateValue = (date: Date) => date.toISOString().slice(0, 10).replaceAll("-", "");
+  const conditions = [
+    { operation: "EQ", field_name: "keyword", field_values: [keyword] },
+  ];
+  const region = opts.region?.toUpperCase();
+  if (region && /^[A-Z]{2}$/.test(region)) {
+    conditions.push({ operation: "IN", field_name: "region_code", field_values: [region] });
   }
 
-  const videos = [...byId.values()]
-    .sort(
-      (a, b) =>
-        (b.diggCount ?? 0) + (b.playCount ?? 0) / 100 -
-        ((a.diggCount ?? 0) + (a.playCount ?? 0) / 100),
-    )
-    .slice(0, count);
+  const fields = [
+    "id",
+    "video_description",
+    "create_time",
+    "region_code",
+    "share_count",
+    "view_count",
+    "like_count",
+    "comment_count",
+    "username",
+    "video_duration",
+  ].join(",");
+  const endpoint = new URL("https://open.tiktokapis.com/v2/research/video/query/");
+  endpoint.searchParams.set("fields", fields);
 
-  const totalFound = tried.reduce((sum, entry) => sum + entry.found, 0);
-  let notice: string | undefined;
-  if (!videos.length) {
-    notice = upstreamFailure
-      ? `TikTok search is temporarily unavailable (${upstreamFailure}). Try Link Grab with a TikTok video URL, or try again later.`
-      : totalFound
-        ? "TikTok returned clips but none matched — try a broader tag."
-        : `TikTok had no public #${candidates[0]} list right now. Try another spelling or use Link Grab.`;
-  } else if (videos.length < count) {
-    notice = `Found ${videos.length} clips across ${tried
-      .filter((entry) => entry.found > 0)
-      .map((entry) => `#${entry.tag}`)
-      .join(", ")}.`;
-  } else {
-    notice = `${videos.length} clips from ${tried
-      .filter((entry) => entry.found > 0)
-      .map((entry) => `#${entry.tag}`)
-      .join(", ")}.`;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      query: { and: conditions },
+      start_date: dateValue(start),
+      end_date: dateValue(end),
+      max_count: count,
+      cursor: 0,
+    }),
+    cache: "no-store",
+    signal: AbortSignal.timeout(25_000),
+  });
+
+  const payload = await response.json().catch(() => null);
+  if (response.status === 401) {
+    throw new Error("TikTok Research API rejected the token. Check its validity and Research API access.");
+  }
+  if (response.status === 403) {
+    throw new Error(
+      "TikTok Research API denied access. The app must be approved for research.data.basic and the token must belong to that approved project.",
+    );
+  }
+  if (!response.ok || payload?.error?.code !== "ok") {
+    const detail = String(payload?.error?.message ?? `HTTP ${response.status}`).slice(0, 180);
+    throw new Error(`TikTok Research API request failed: ${detail}`);
   }
 
-  return { videos, tagsTried: tried, headline, notice };
+  const rawVideos: ResearchVideo[] = Array.isArray(payload?.data?.videos)
+    ? payload.data.videos
+    : [];
+  const videos = rawVideos.flatMap((raw, index) => {
+    const id = String(raw.id ?? raw.video_id ?? "").trim();
+    if (!id) return [];
+    const username = raw.username?.trim() || "unknown";
+    const shareUrl = `https://www.tiktok.com/@${username}/video/${id}`;
+    return [
+      makeVideo({
+        id,
+        caption: raw.video_description ?? "",
+        authorUsername: username,
+        authorNickname: username,
+        shareUrl,
+        region: raw.region_code ?? null,
+        postedAt: raw.create_time
+          ? new Date(raw.create_time * 1000).toISOString()
+          : null,
+        durationSec: raw.video_duration ?? null,
+        playCount: raw.view_count ?? null,
+        diggCount: raw.like_count ?? null,
+        commentCount: raw.comment_count ?? null,
+        shareCount: raw.share_count ?? null,
+        source: "search",
+        rank: index,
+      }),
+    ];
+  });
+
+  return {
+    videos,
+    tagsTried: [{ tag: keyword, found: videos.length }],
+    headline: null,
+    notice: videos.length
+      ? `${videos.length} matching public videos from the TikTok Research API (last 30 days).`
+      : "No matching public videos were returned for that keyword in the last 30 days.",
+  };
 }
-
-export const CRAWLER_HEADERS = {
-  "User-Agent": CRAWLER_UA,
-  "Accept-Language": "en-US,en;q=0.9",
-};

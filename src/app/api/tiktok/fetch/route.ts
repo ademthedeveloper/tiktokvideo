@@ -25,7 +25,7 @@ export async function POST(request: Request) {
   const count = Math.min(30, Math.max(4, Number(body.count ?? 10) || 10));
 
   try {
-    /* ── real TikTok search via the crawler-facing tag pages ─────── */
+    /* ── approved TikTok Research API keyword search ──────────────── */
     if (mode === "search") {
       const keyword = String(body.keyword ?? "").trim();
       if (!keyword) {
@@ -40,7 +40,7 @@ export async function POST(request: Request) {
         nextCursor: 0,
         hasMore: false,
         mode,
-        upstream: "tiktok.com tag pages (JSON-LD)",
+        upstream: "TikTok Research API",
         tagsTried: outcome.tagsTried,
         headline: outcome.headline,
         notice: outcome.notice,

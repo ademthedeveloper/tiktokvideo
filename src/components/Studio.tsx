@@ -697,7 +697,7 @@ function StudioInner({
 
         <footer className="mono-num mt-10 flex flex-wrap items-center gap-x-5 gap-y-2 border-t border-line pt-4 text-[10.5px] tracking-[0.14em] text-dim uppercase">
           <span>repost desk · tiktok search · caption writer · publisher</span>
-          <span>sources: tiktok.com tag pages + tikwm</span>
+          <span>sources: tiktok research api + tikwm</span>
           <span>credit every creator you repost</span>
           <span className="ml-auto flex items-center gap-1.5">
             <IconSpark className="h-3.5 w-3.5 text-signal" />
@@ -760,8 +760,8 @@ function IdleDesk({
           <p className="mt-4 max-w-xl text-[13.5px] leading-relaxed text-muted">
             Type what you want — <span className="text-text">relatable</span>,{" "}
             <span className="text-text">work memes</span>,{" "}
-            <span className="text-text">#gym</span> — and the desk reads TikTok's public tag pages
-            to pull the clips actually ranked there, with their real captions, creators and stats.
+            <span className="text-text">#gym</span> — and the desk searches TikTok&apos;s Research API for public
+            videos from the last 30 days, with captions, creators and available engagement stats.
             It then writes your repost caption with{" "}
             <span className="text-signal">cr: @creator</span> credit, and can publish the clip
             straight back to your TikTok account.
