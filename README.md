@@ -73,16 +73,30 @@ blocked this IP" from "this provider changed its response".
 | `TIKWM_BASE_URL` | use a tikwm mirror instead of `https://www.tikwm.com` |
 | `TIKTOK_COOKIE` | a logged-out browser cookie header; makes direct tiktok.com reads far more reliable |
 | `TIKTOK_PROXY_URL` / `TIKTOK_PROXY_SECRET` | route tikwm/tiktok.com through your own proxy (`tools/tiktok-proxy-worker`) |
+| `TIKTOK_PUBLIC_RELAY` | set to `off` to stop the server borrowing a free `?url=` relay when a host blocks its IP |
 | `TIKTOK_FETCH_URL` / `TIKTOK_FETCH_TOKEN` | your own fetch service, used before public scrapers (see §4) |
 
-### If tikwm blocks your host (`403 bot challenge`)
+### If your host is blocked (`403 bot challenge`, or HTML instead of JSON)
 
-Vercel/Lambda/Fly/Render egress from datacenter IPs, and Cloudflare answers those
-with a bot challenge — that is the `tikwm is serving a bot-challenge page — HTTP
-403` error. Two ways around it; the first needs no server:
+Vercel/Lambda/Fly/Render egress from datacenter IPs. Cloudflare answers those
+with a bot challenge — the `tikwm is serving a bot-challenge page — HTTP 403`
+error — and tiktok.com soft-blocks them too, serving its website shell instead of
+the API's JSON (`TikTok served its page instead of JSON — HTTP 200`). Neither is
+a bug in the request: the *address* is the problem. What happens, in order:
 
-1. **Cloudflare Worker proxy (free, ~2 minutes).** Deploy
-   [`tools/tiktok-proxy-worker`](tools/tiktok-proxy-worker), then set:
+- **Nothing — the server just works** whenever the host isn't blocked.
+- **The same search is retried from your browser.** When the server answer is
+   empty, the UI asks tikwm from the reader's own connection (a laptop or phone
+   is not a datacenter IP) and posts the raw JSON to `/api/tiktok/import`, which
+   normalises it server-side. This needs no setup and shows up as
+   `your browser → tikwm` in the attempts list and in diagnostics.
+- **The server borrows a free relay.** If a host blocks the server, `request()`
+   retries that GET through a key-less `?url=` relay (`allorigins`,
+   `corsproxy.io`, `cors.lol`) and records which one answered:
+   `via allorigins relay`. Turn it off with `TIKTOK_PUBLIC_RELAY=off`.
+- **Your own proxy — the dependable route.** Deploy
+   [`tools/tiktok-proxy-worker`](tools/tiktok-proxy-worker) (free, ~2 minutes),
+   then set:
 
    ```bash
    TIKTOK_PROXY_URL=https://<your-worker>.workers.dev/
@@ -90,14 +104,11 @@ with a bot challenge — that is the `tikwm is serving a bot-challenge page — 
    ```
 
    Only tikwm/tiktok.com requests are routed through it; everything else is
-   untouched.
+   untouched. The Worker egresses from Cloudflare's edge, which tikwm answers
+   normally.
 
-2. **Self-hosted sidecar** (§4) — searches then skip tikwm entirely.
-
-`tiktok.com` itself is usually reachable from datacenter IPs, so the desk also
-queries TikTok's own hashtag/item-list API (`/api/challenge/...`) as a provider.
-That path needs no proxy, but TikTok sometimes demands a request signature,
-which is why the proxy is the dependable fallback.
+A self-hosted sidecar (§4) is the other way out: searches then skip tikwm
+entirely.
 
 ### If your network blocks everything
 

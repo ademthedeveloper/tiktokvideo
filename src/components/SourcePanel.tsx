@@ -3,6 +3,7 @@
 import { useCallback, useMemo, useState } from "react";
 import type { DiagnosticsCheck, FetchMode, ProviderAttempt, Settings } from "@/lib/types";
 import { REGIONS, extractTikTokLinks } from "@/lib/tiktok-client";
+import { browserEgress, browserEgressSupported } from "@/lib/browser-egress";
 import { HASHTAG_PACKS, STYLE_META } from "@/lib/captions";
 import { Button, Chip, Field, Spinner, inputClass } from "./ui";
 import {
@@ -109,15 +110,35 @@ export function SourcePanel({
 
   const runDiagnostics = useCallback(async () => {
     setDiagnostics((prev) => ({ ...prev, loading: true, error: null }));
+    /* Ask the server and this browser at the same time: they reach different IPs. */
+    const browserProbe = browserEgressSupported()
+      ? browserEgress({ mode: "search", keyword: "cat", count: 2 })
+      : Promise.resolve(null);
     try {
-      const res = await fetch("/api/tiktok/diagnostics", { cache: "no-store" });
+      const [res, egress] = await Promise.all([
+        fetch("/api/tiktok/diagnostics", { cache: "no-store" }),
+        browserProbe,
+      ]);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      const checks: DiagnosticsCheck[] = Array.isArray(data.checks) ? [...data.checks] : [];
+      if (egress) {
+        const attempt = egress.attempts[0];
+        checks.push({
+          id: "browser-egress",
+          label: "your browser → tikwm",
+          ok: egress.ok,
+          latencyMs: attempt?.ms ?? 0,
+          detail: egress.ok
+            ? "read from this connection — the automatic browser fallback covers a blocked host"
+            : `${attempt?.error ?? "unreachable"} — the fallback cannot help here either, so set TIKTOK_PROXY_URL`,
+        });
+      }
       setDiagnostics({
         loading: false,
         at: new Date().toLocaleTimeString("en-GB"),
         error: null,
-        checks: Array.isArray(data.checks) ? data.checks : [],
+        checks,
         uploader: data.uploader ?? null,
       });
     } catch (err) {
@@ -221,9 +242,9 @@ export function SourcePanel({
               ))}
             </div>
             <p className="text-[11px] leading-snug text-dim">
-              Search fans out over tikwm keyword search, #hashtag variants and TikTok&apos;s own
-              tag pages, so you get the clips actually ranked under your search — with real
-              captions, stats and creators.
+              Search fans out over tikwm keyword search, TikTok&apos;s own hashtag API and tag
+              pages. If the server&apos;s address is blocked upstream, the same search is retried
+              from your browser, so the fallback uses your connection instead of the host&apos;s.
             </p>
           </div>
         ) : null}
@@ -414,8 +435,9 @@ export function SourcePanel({
           </ul>
         ) : (
           <p className="mt-2 text-[11px] leading-snug text-dim">
-            Search falls back across tikwm, #hashtag variants and tiktok.com tag pages. Run a
-            diagnostics sweep to see which upstream this machine can actually reach.
+            Search falls back across tikwm, TikTok&apos;s hashtag API and tag pages — then through
+            this browser if the host is blocked. Run a sweep to see which upstream each address
+            can actually reach.
           </p>
         )}
 
