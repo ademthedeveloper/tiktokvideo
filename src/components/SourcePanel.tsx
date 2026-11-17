@@ -79,6 +79,7 @@ export function SourcePanel({
   hasMore,
   settings,
   onFetch,
+  onImportText,
   onLoadMore,
   onGotoRecipe,
 }: {
@@ -96,10 +97,12 @@ export function SourcePanel({
   hasMore: boolean;
   settings: Settings;
   onFetch: () => void;
+  onImportText: (text: string) => void;
   onLoadMore: () => void;
   onGotoRecipe: () => void;
 }) {
   const parsedLinks = useMemo(() => extractTikTokLinks(links), [links]);
+  const [paste, setPaste] = useState("");
   const [diagnostics, setDiagnostics] = useState<{
     loading: boolean;
     at: string | null;
@@ -246,6 +249,52 @@ export function SourcePanel({
               pages. If the server&apos;s address is blocked upstream, the same search is retried
               from your browser, so the fallback uses your connection instead of the host&apos;s.
             </p>
+
+            {/* Last resort: the one route nothing can block — a tab and a paste. */}
+            <details className="border border-line bg-pit/50 px-3 py-2">
+              <summary className="cursor-pointer font-display text-[10.5px] font-semibold tracking-[0.14em] text-dim uppercase select-none">
+                still empty? paste it by hand
+              </summary>
+              <div className="mt-2 space-y-2">
+                <p className="text-[11px] leading-snug text-muted">
+                  Open this in a new tab — it is tikwm&apos;s own answer for your search, read
+                  straight from your connection, no page in between:
+                </p>
+                <a
+                  className="mono-num block overflow-hidden text-[10.5px] break-all text-signal underline decoration-signal/40 underline-offset-2"
+                  href={`https://www.tikwm.com/api/feed/search?keywords=${encodeURIComponent(
+                    keyword.replace(/^#/, ""),
+                  )}&count=${count}&cursor=0&region=${region}`}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                >
+                  tikwm.com/api/feed/search?keywords=
+                  {encodeURIComponent(keyword.replace(/^#/, ""))}
+                </a>
+                <p className="text-[11px] leading-snug text-muted">
+                  Copy everything the tab shows (it starts with{" "}
+                  <code className="text-dim">{'{"code":0'}</code>) and paste it here:
+                </p>
+                <textarea
+                  className={`${inputClass} mono-num h-20 resize-y text-[10.5px] leading-relaxed`}
+                  value={paste}
+                  spellCheck={false}
+                  placeholder='{"code":0,"msg":"success","data":{"videos":[…'
+                  onChange={(event) => setPaste(event.target.value)}
+                />
+                <Button
+                  onClick={() => {
+                    if (!paste.trim()) return;
+                    onImportText(paste);
+                    setPaste("");
+                  }}
+                  disabled={!paste.trim() || busy}
+                >
+                  <IconArrow className="h-3.5 w-3.5" />
+                  Use pasted JSON
+                </Button>
+              </div>
+            </details>
           </div>
         ) : null}
 

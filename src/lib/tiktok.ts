@@ -46,6 +46,7 @@ import {
   videoDetail,
   webApiCheck,
 } from "./providers/tiktok-api";
+import { creativeCenterCheck, creativeCenterTop } from "./providers/creative-center";
 import {
   fromAny,
   sidecarCheck,
@@ -620,6 +621,27 @@ export async function fetchFirehose(opts: {
     /* fall through to search */
   }
 
+  /* TikTok's own trends report — no tikwm, no www.tiktok.com shell. */
+  try {
+    const page = await withTimeout(
+      creativeCenterTop({ region, count }),
+      16_000,
+      "creative center trends",
+    );
+    if (page.videos.length) {
+      return {
+        videos: page.videos.map((video, index) => ({ ...video, rank: cursor + index })),
+        nextCursor: cursor + count,
+        hasMore: false,
+        upstream: "TikTok Creative Center (official trends)",
+        notice: `${page.videos.length} of TikTok's top ${region} videos right now, straight from TikTok's own trends report.`,
+        degraded: true,
+      };
+    }
+  } catch {
+    /* fall through to search */
+  }
+
   const fallback = await searchClips({ keyword: "fyp", count, region });
   return {
     videos: fallback.videos,
@@ -911,6 +933,15 @@ export async function describeProviders(): Promise<ProviderCheck[]> {
       detail: shortError(err),
     });
   }
+
+  const trendsCheck = await creativeCenterCheck();
+  checks.push({
+    id: "creative-center",
+    label: "TikTok Creative Center trends",
+    ok: trendsCheck.ok,
+    latencyMs: trendsCheck.latencyMs,
+    detail: trendsCheck.detail,
+  });
 
   /* Say out loud when a public relay did the borrowing. */
   const relay = lastUpstreamRelay();

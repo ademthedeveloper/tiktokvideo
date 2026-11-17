@@ -6,15 +6,16 @@
  * Vercel/Lambda/Fly addresses are routinely blocked by tikwm (Cloudflare answers
  * a bot-challenge page) and soft-blocked by tiktok.com (it serves the website
  * shell instead of the API's JSON). No header fixes that: the address is the
- * problem. A phone or laptop on a normal home connection is not blocked, so the
- * cheapest reliable fallback is to let the reader's own browser do the request.
+ * problem. A phone or laptop on a normal home connection is normally not
+ * blocked, so the cheapest fallback is to let the reader's own browser do the
+ * request — and to race a few CORS-open relays for it, because the browser may
+ * still be stopped by tikwm's own CORS headers or by an ad blocker.
  *
  * This module only *fetches* — normalising the payloads into clips happens on
  * the server (/api/tiktok/import), so there is exactly one parser.
  *
- * Everything here is best effort and named: if the browser cannot read the
- * upstream (CORS, offline, blocked), the attempt says so instead of failing
- * silently.
+ * Everything is best effort and named: if nobody can read the upstream, the
+ * attempts say who refused and why.
  */
 
 import type { FetchMode, ProviderAttempt } from "./types";
@@ -29,6 +30,42 @@ export type EgressOutcome = {
 };
 
 const TIKWM_BASE = "https://www.tikwm.com";
+const TIMEOUT_MS = 8_000;
+
+type Route = { name: string; build: (url: string) => string; headers?: Record<string, string> };
+
+/**
+ * Ways to reach an upstream from a browser.
+ *
+ * The direct call is fastest and carries the reader's real IP, but tikwm may
+ * refuse to let another origin read it. The relays are CORS-open by design, so
+ * they work even when the upstream's own headers would block us — and each one
+ * borrows yet another address.
+ */
+const ROUTES: Route[] = [
+  { name: "", build: (url) => url },
+  {
+    name: "allorigins → ",
+    build: (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  },
+  {
+    name: "codetabs → ",
+    build: (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+  },
+  {
+    name: "jina → ",
+    build: (url) => `https://r.jina.ai/${url}`,
+    headers: { "x-return-format": "text" },
+  },
+  {
+    name: "cors.lol → ",
+    build: (url) => `https://api.cors.lol/?url=${encodeURIComponent(url)}`,
+  },
+  {
+    name: "corsproxy.io → ",
+    build: (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+  },
+];
 
 export function browserEgressSupported(): boolean {
   return typeof window !== "undefined" && typeof fetch === "function";
@@ -36,7 +73,7 @@ export function browserEgressSupported(): boolean {
 
 function describe(err: unknown): string {
   if (err instanceof TypeError) {
-    return "the browser could not read tikwm (CORS or network)";
+    return "the browser could not read it (CORS, ad blocker or network)";
   }
   return err instanceof Error ? err.message : "browser fetch failed";
 }
@@ -45,43 +82,46 @@ function clip(text: string, max = 90): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
-/**
- * Ways to reach tikwm from a browser. The direct call needs tikwm to allow
- * cross-origin reads; the relays are CORS-open by design, so they work even when
- * tikwm's own headers would block us (or when the browser's IP is refused).
- */
-const BROWSER_RELAYS: { name: string; wrap: (url: string) => string }[] = [
-  { name: "", wrap: (url) => url },
-  {
-    name: "allorigins → ",
-    wrap: (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-  },
-  {
-    name: "corsproxy.io → ",
-    wrap: (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
-  },
-];
+/** Pull the first JSON object/array out of a body wrapped in prose or fences. */
+function extractJson(text: string): any | null {
+  const body = text.replace(/^\uFEFF/, "").trim();
+  if (!body) return null;
+  const candidates = [body];
+  const from = body.indexOf("{");
+  const to = body.lastIndexOf("}");
+  if (from !== -1 && to > from) candidates.push(body.slice(from, to + 1));
+  const arrFrom = body.indexOf("[");
+  const arrTo = body.lastIndexOf("]");
+  if (arrFrom !== -1 && arrTo > arrFrom) candidates.push(body.slice(arrFrom, arrTo + 1));
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
 
-/** Read JSON straight from an upstream, with a timeout and a readable error. */
-async function readJson(url: string, timeoutMs = 11_000): Promise<any> {
+async function readJson(url: string, headers?: Record<string, string>): Promise<any> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   try {
     const res = await fetch(url, {
       signal: controller.signal,
       cache: "no-store",
       credentials: "omit",
       mode: "cors",
-      headers: { Accept: "application/json, text/plain, */*" },
+      headers: { Accept: "application/json, text/plain, */*", ...(headers ?? {}) },
     });
     const text = await res.text();
-    if (!res.ok) throw new Error(`HTTP ${res.status}${text.trim() ? ` · ${clip(text.trim(), 60)}` : ""}`);
-    const head = text.trimStart();
-    if (!head.startsWith("{")) throw new Error("answered with a web page, not JSON");
-    return JSON.parse(head);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = extractJson(text);
+    if (!json) throw new Error("answered with a page, not JSON");
+    return json;
   } catch (err) {
     if (controller.signal.aborted) {
-      throw new Error(`timed out after ${(timeoutMs / 1000).toFixed(0)}s`);
+      throw new Error(`timed out after ${(TIMEOUT_MS / 1000).toFixed(0)}s`);
     }
     throw err;
   } finally {
@@ -98,8 +138,34 @@ function videosIn(body: any): number {
   return 0;
 }
 
+type RouteResult = { name: string; body: any; ms: number } | { name: string; error: string };
+
+/** Ask every route at once and keep the first that returns clips. */
+async function raceRoutes(url: string): Promise<{
+  winner: { name: string; body: any; ms: number } | null;
+  results: RouteResult[];
+}> {
+  const started = Date.now();
+  const settled = await Promise.all(
+    ROUTES.map(async (route): Promise<RouteResult> => {
+      try {
+        const body = await readJson(route.build(url), route.headers);
+        return { name: route.name, body, ms: Date.now() - started };
+      } catch (err) {
+        return { name: route.name, error: describe(err) };
+      }
+    }),
+  );
+  const winner =
+    settled.find(
+      (result): result is { name: string; body: any; ms: number } =>
+        !("error" in result) && videosIn(result.body) > 0,
+    ) ?? null;
+  return { winner, results: settled };
+}
+
 /**
- * Ask tikwm from the reader's connection.
+ * Ask for a search / creator / link / firehose page from the reader's network.
  * Returns raw payloads for the server to normalise — never clips.
  */
 export async function browserEgress(opts: {
@@ -151,30 +217,28 @@ export async function browserEgress(opts: {
   }
 
   for (const target of targets) {
-    /* Direct first (a home connection usually is not blocked), then relays that
-     * are built to be read from a browser whatever tikwm's own CORS policy is. */
-    for (const relay of BROWSER_RELAYS) {
-      const started = Date.now();
-      const label = `your browser → ${relay.name}${target.what}`;
-      const query = target.query;
-      try {
-        const body = await readJson(relay.wrap(target.url));
-        const found = videosIn(body);
-        attempts.push({ provider: label, query, found, ms: Date.now() - started });
-        if (found > 0) {
-          payloads.push({ provider: label, ms: Date.now() - started, body });
-          break;
-        }
-      } catch (err) {
+    const { winner, results } = await raceRoutes(target.url);
+    const label = (name: string) => `your browser → ${name}${target.what}`;
+
+    if (winner) {
+      attempts.push({
+        provider: label(winner.name),
+        query: target.query,
+        found: videosIn(winner.body),
+        ms: winner.ms,
+      });
+      payloads.push({ provider: label(winner.name), ms: winner.ms, body: winner.body });
+    } else {
+      /* Nothing worked: report every route so the wall is never a mystery. */
+      for (const result of results) {
         attempts.push({
-          provider: label,
-          query,
+          provider: label(result.name),
+          query: target.query,
           found: 0,
-          error: clip(describe(err)),
-          ms: Date.now() - started,
+          error: clip("error" in result ? result.error : "no clips in the answer"),
+          ms: 0,
         });
       }
-      if (payloads.length >= 6) break;
     }
     if (payloads.length >= 6) break;
   }

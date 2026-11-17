@@ -20,7 +20,7 @@
 
 import type { TikTokVideo } from "../types";
 import { makeVideo } from "../video-factory";
-import { BROWSER_UA, UpstreamError, request, toNumber } from "./net";
+import { BROWSER_UA, UpstreamError, fetchViaRelays, request, toNumber } from "./net";
 import { fromWebItem } from "./tiktok-web";
 
 const ORIGIN = "https://www.tiktok.com";
@@ -131,7 +131,7 @@ async function apiGet(
     PROVIDER,
   );
 
-  const text = await res.text();
+  let text = await res.text();
   if (!res.ok) {
     throw new UpstreamError(
       "TikTok's web API refused the request",
@@ -145,13 +145,19 @@ async function apiGet(
      * HTTP 200 + the HTML app shell means TikTok bot-filtered this IP: the API
      * path falls through to the website's page instead of the JSON it serves
      * browsers it trusts. Nothing about the request is wrong — the address is.
+     * So ask a relay to make the same call from somewhere else before giving up.
      */
-    throw new UpstreamError(
-      "TikTok served its page instead of JSON",
-      `HTTP ${res.status} on ${path} — this IP is bot-filtered; it needs a proxy or a real browser`,
-      PROVIDER,
-      res.status,
-    );
+    const relayed = await fetchViaRelays(url.toString(), 9_000, PROVIDER).catch(() => null);
+    if (relayed) {
+      text = relayed.text;
+    } else {
+      throw new UpstreamError(
+        "TikTok served its page instead of JSON",
+        `HTTP ${res.status} on ${path} — this IP is bot-filtered; it needs a proxy or a real browser`,
+        PROVIDER,
+        res.status,
+      );
+    }
   }
 
   let json: any;

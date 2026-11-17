@@ -44,8 +44,20 @@ attempt is reported back to the UI:
 | --------- | --------------------------------- | ------------------------------------------- | ----------------------- |
 | Search    | optional self-hosted sidecar      | tikwm `/api/feed/search` (keyword + hashtag) | tiktok.com web API (`/api/challenge/item_list/`) → `tiktok.com/tag/<tag>` |
 | Link grab | optional sidecar                  | tikwm `/api/`                                | tiktok.com web API → embed → video page → oEmbed |
-| Firehose  | tikwm `/api/feed/list`            | tikwm search `fyp`                           | —                       |
+| Firehose  | tikwm `/api/feed/list`            | tiktok.com `#fyp` item list → **TikTok Creative Center top videos** (official, no tikwm) | tikwm search `'fyp'` |
 | Enrich    | optional sidecar                  | tikwm `/api/`                                | tiktok.com embed → video page |
+
+Every upstream above can be reached by two more routes that are not tikwm and
+not www.tiktok.com:
+
+- **Your browser.** If the server's answer comes back empty, the same request is
+  repeated from the reader's connection (`your browser → …` rows).
+- **Public relays.** A blocked request is replayed through several key-less
+  `?url=` relays *in parallel* (`allorigins`, `codetabs`, `jina`, `corsproxy.io`,
+  `cors.lol`) and the first real JSON wins: `via codetabs relay`.
+- **By hand.** Search → *still empty? paste it by hand* opens tikwm's own JSON in
+  a tab; paste it back and `/api/tiktok/import` normalises it. Nothing about
+  that route can be blocked.
 
 - `@handle` searches list that creator's recent posts (tikwm `/api/user/posts`).
 - Results are de-duplicated by video id and sorted by engagement.
@@ -59,7 +71,9 @@ probes, live, from the machine that runs the app:
 
 - `tikwm feed` — is the middleman reachable at all
 - `tikwm keyword search` — does a real query return clips
-- `tiktok.com reachability` / `tiktok.com #tag page`
+- `tiktok.com reachability` / `tiktok.com #tag page` / `tiktok.com web api`
+- `TikTok Creative Center trends` — TikTok's own ad-platform report (no tikwm)
+- `your browser → tikwm` — the client-side fallback, checked from the tab
 - `self-hosted fetch service` — only when `TIKTOK_FETCH_URL` is set
 - `posting uploader` — is the session uploader installed
 
@@ -90,10 +104,15 @@ a bug in the request: the *address* is the problem. What happens, in order:
    is not a datacenter IP) and posts the raw JSON to `/api/tiktok/import`, which
    normalises it server-side. This needs no setup and shows up as
    `your browser → tikwm` in the attempts list and in diagnostics.
-- **The server borrows a free relay.** If a host blocks the server, `request()`
-   retries that GET through a key-less `?url=` relay (`allorigins`,
-   `corsproxy.io`, `cors.lol`) and records which one answered:
-   `via allorigins relay`. Turn it off with `TIKTOK_PUBLIC_RELAY=off`.
+- **The server borrows a free relay.** If a host blocks the server, the GET is
+   replayed through several key-less `?url=` relays *at the same time* —
+   `allorigins`, `codetabs`, `jina`, `corsproxy.io`, `cors.lol` — and the first
+   that returns real JSON answers; the UI names it (`via codetabs relay`).
+   Same for a `200` that turns out to be a website shell instead of JSON.
+   Turn it off with `TIKTOK_PUBLIC_RELAY=off`.
+- **You paste it in.** *still empty? paste it by hand* opens the upstream's JSON
+   in a tab and posts it to `/api/tiktok/import` for normalising. Last resort,
+   but nothing on the network can refuse a copy-paste.
 - **Your own proxy — the dependable route.** Deploy
    [`tools/tiktok-proxy-worker`](tools/tiktok-proxy-worker) (free, ~2 minutes),
    then set:

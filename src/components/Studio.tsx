@@ -447,6 +447,55 @@ function StudioInner({
     [mode, keyword, region, links, count, cursor, settings, toast, runEnrichment, refreshPosts],
   );
 
+  /**
+   * Manual escape hatch: the reader opened a tikwm URL in a tab and pasted the
+   * JSON here. Normalising stays on the server (same route the browser
+   * fallback uses), so no parser lives in the client.
+   */
+  const importPasted = useCallback(
+    async (text: string) => {
+      setState((prev) => ({ ...prev, loading: true, error: null, notice: "Reading the pasted JSON…" }));
+      try {
+        const res = await fetch("/api/tiktok/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mode, keyword, count, text }),
+        });
+        const data = (await res.json()) as FetchResult & { error?: string };
+        if (!res.ok || data.error) throw new Error(data.error ?? `HTTP ${res.status}`);
+        const incoming = data.videos ?? [];
+        setResults((prev) => {
+          const seen = new Set(prev.map((video) => video.id));
+          return [...prev, ...incoming.filter((video) => !seen.has(video.id))];
+        });
+        setState({
+          loading: false,
+          appending: false,
+          error: null,
+          notice: data.notice ?? `${incoming.length} clips read`,
+          upstream: data.upstream ?? "pasted JSON",
+          degraded: false,
+          count: incoming.length,
+          at: clock(),
+          tagsTried: [],
+          attempts: data.attempts ?? [],
+          resolving: 0,
+        });
+        if (incoming.length) {
+          toast(`${incoming.length} clips read`, "ok", data.notice ?? undefined);
+          void runEnrichment(incoming);
+        } else {
+          toast("Nothing usable in that JSON", "warn", data.notice ?? undefined);
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Could not read that JSON";
+        setState((prev) => ({ ...prev, loading: false, error: message, notice: null }));
+        toast("Could not read that JSON", "warn", message);
+      }
+    },
+    [mode, keyword, count, toast, runEnrichment],
+  );
+
   /* ── save / status / delete ──────────────────────────────────── */
   const saveClip = useCallback(
     async (video: TikTokVideo, variant?: CaptionVariant, note = "") => {
@@ -580,6 +629,7 @@ function StudioInner({
                 hasMore={hasMore}
                 settings={settings}
                 onFetch={() => void runFetch(false)}
+                onImportText={(text) => void importPasted(text)}
                 onLoadMore={() => void runFetch(true)}
                 onGotoRecipe={() => setTab("recipe")}
               />
