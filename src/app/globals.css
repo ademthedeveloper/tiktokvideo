@@ -315,3 +315,20 @@ select {
     animation: none;
   }
 }
+
+/* Which build am I looking at? (Vercel preview vs production sanity check) */
+.build-stamp {
+  position: fixed;
+  right: 10px;
+  bottom: 8px;
+  z-index: 40;
+  padding: 2px 6px;
+  border: 1px solid var(--color-line);
+  background: color-mix(in oklab, var(--color-pit) 85%, transparent);
+  color: var(--color-dim);
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  pointer-events: none;
+  opacity: 0.75;
+}

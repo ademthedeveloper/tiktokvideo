@@ -67,6 +67,7 @@ export function toPublishJob(row: any): PublishJob {
     mode: row.mode ?? "DIRECT_POST",
     privacyLevel: row.privacyLevel ?? "SELF_ONLY",
     publishId: row.publishId ?? null,
+    provider: row.provider ?? "",
     status: row.status ?? "PENDING",
     failReason: row.failReason ?? null,
     publicPostIds: row.publicPostIds ?? "",

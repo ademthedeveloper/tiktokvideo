@@ -133,7 +133,7 @@ export async function describeAccount(request?: Request): Promise<TikTokAccount>
   if (!auth.token) {
     account.note = clientKey
       ? "Client key found — connect your TikTok account to start posting."
-      : "Add TIKTOK_CLIENT_KEY / TIKTOK_CLIENT_SECRET (or a TIKTOK_ACCESS_TOKEN) to enable posting.";
+      : "No developer app configured. Link a sessionid instead — no app or review needed.";
     return account;
   }
 

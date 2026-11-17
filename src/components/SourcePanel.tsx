@@ -1,7 +1,7 @@
 "use client";
 
-import { useMemo } from "react";
-import type { FetchMode, Settings } from "@/lib/types";
+import { useCallback, useMemo, useState } from "react";
+import type { DiagnosticsCheck, FetchMode, ProviderAttempt, Settings } from "@/lib/types";
 import { REGIONS, extractTikTokLinks } from "@/lib/tiktok-client";
 import { HASHTAG_PACKS, STYLE_META } from "@/lib/captions";
 import { Button, Chip, Field, Spinner, inputClass } from "./ui";
@@ -25,6 +25,7 @@ export type FetchState = {
   count: number;
   at: string | null;
   tagsTried?: { tag: string; found: number }[];
+  attempts?: ProviderAttempt[];
   resolving?: number;
 };
 
@@ -32,7 +33,7 @@ const MODES: { id: FetchMode; label: string; blurb: string; Icon: typeof IconRad
   {
     id: "search",
     label: "Search TikTok",
-    blurb: "Real tag search — the clips actually carrying your keyword.",
+    blurb: "Keyword or #hashtag — with automatic fallback upstreams.",
     Icon: IconScan,
   },
   {
@@ -98,6 +99,37 @@ export function SourcePanel({
   onGotoRecipe: () => void;
 }) {
   const parsedLinks = useMemo(() => extractTikTokLinks(links), [links]);
+  const [diagnostics, setDiagnostics] = useState<{
+    loading: boolean;
+    at: string | null;
+    error: string | null;
+    checks: DiagnosticsCheck[];
+    uploader: { ok: boolean; mode: string; detail: string } | null;
+  }>({ loading: false, at: null, error: null, checks: [], uploader: null });
+
+  const runDiagnostics = useCallback(async () => {
+    setDiagnostics((prev) => ({ ...prev, loading: true, error: null }));
+    try {
+      const res = await fetch("/api/tiktok/diagnostics", { cache: "no-store" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      setDiagnostics({
+        loading: false,
+        at: new Date().toLocaleTimeString("en-GB"),
+        error: null,
+        checks: Array.isArray(data.checks) ? data.checks : [],
+        uploader: data.uploader ?? null,
+      });
+    } catch (err) {
+      setDiagnostics({
+        loading: false,
+        at: new Date().toLocaleTimeString("en-GB"),
+        error: err instanceof Error ? err.message : "diagnostics failed",
+        checks: [],
+        uploader: null,
+      });
+    }
+  }, []);
   const busy = state.loading || state.appending;
   const activeTags = settings.packs.flatMap((pack) => HASHTAG_PACKS[pack]?.tags ?? []);
   const triedSummary = (state.tagsTried ?? [])
@@ -189,8 +221,9 @@ export function SourcePanel({
               ))}
             </div>
             <p className="text-[11px] leading-snug text-dim">
-              The desk reads TikTok's public tag pages, so you get the clips that are actually
-              ranked under your search — with their real captions, stats and creators.
+              Search fans out over tikwm keyword search, #hashtag variants and TikTok&apos;s own
+              tag pages, so you get the clips actually ranked under your search — with real
+              captions, stats and creators.
             </p>
           </div>
         ) : null}
@@ -334,6 +367,103 @@ export function SourcePanel({
         ) : null}
       </div>
 
+      {/* diagnostics */}
+      <div
+        className="border border-line bg-panel/50 p-4"
+        style={{
+          clipPath:
+            "polygon(0 0, calc(100% - 16px) 0, 100% 16px, 100% 100%, 16px 100%, 0 calc(100% - 16px))",
+        }}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <p className="mono-num text-[10px] tracking-[0.24em] text-dim uppercase">
+            fetch health
+          </p>
+          <button
+            type="button"
+            onClick={runDiagnostics}
+            disabled={diagnostics.loading}
+            className="font-display flex items-center gap-1 text-[10.5px] font-semibold tracking-[0.14em] text-signal uppercase transition-colors hover:text-text disabled:opacity-50"
+          >
+            {diagnostics.loading ? <Spinner className="h-3 w-3" /> : <IconRadar className="h-3.5 w-3.5" />}
+            {diagnostics.loading ? "checking" : "run diagnostics"}
+          </button>
+        </div>
+
+        {state.attempts?.length ? (
+          <ul className="mt-2 space-y-1">
+            {state.attempts.slice(0, 6).map((attempt, index) => (
+              <li
+                key={`${attempt.provider}-${index}`}
+                className="flex items-start gap-2 text-[11px] leading-snug"
+              >
+                <span
+                  className={`mono-num mt-1 h-1.5 w-1.5 shrink-0 rounded-full ${
+                    attempt.error ? "bg-flare" : attempt.found ? "bg-acid" : "bg-dim"
+                  }`}
+                />
+                <span className="min-w-0 break-words text-muted">
+                  <b className="text-text">{attempt.provider}</b>{" "}
+                  <span className="text-dim">{attempt.query}</span>{" "}
+                  <span className={attempt.error ? "text-flare/90" : "text-dim"}>
+                    — {attempt.error ?? `${attempt.found} clips`} · {attempt.ms}ms
+                  </span>
+                </span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="mt-2 text-[11px] leading-snug text-dim">
+            Search falls back across tikwm, #hashtag variants and tiktok.com tag pages. Run a
+            diagnostics sweep to see which upstream this machine can actually reach.
+          </p>
+        )}
+
+        {diagnostics.error ? (
+          <p className="mt-2 text-[11px] leading-snug text-flare/90">{diagnostics.error}</p>
+        ) : null}
+
+        {diagnostics.checks.length ? (
+          <ul className="mt-2.5 space-y-1 border-t border-line pt-2.5">
+            {diagnostics.checks.map((check) => (
+              <li key={check.id} className="flex items-start gap-2 text-[11px] leading-snug">
+                <span
+                  className={`mono-num mt-1 h-1.5 w-1.5 shrink-0 rounded-full ${
+                    check.ok ? "bg-acid" : "bg-flare"
+                  }`}
+                />
+                <span className="min-w-0 break-words text-muted">
+                  <b className="text-text">{check.label}</b>{" "}
+                  <span className="text-dim">{check.latencyMs}ms</span>{" "}
+                  <span className={check.ok ? "text-dim" : "text-flare/90"}>— {check.detail}</span>
+                </span>
+              </li>
+            ))}
+            {diagnostics.uploader ? (
+              <li className="flex items-start gap-2 border-t border-line pt-2 text-[11px] leading-snug">
+                <span
+                  className={`mono-num mt-1 h-1.5 w-1.5 shrink-0 rounded-full ${
+                    diagnostics.uploader.ok ? "bg-acid" : "bg-amber"
+                  }`}
+                />
+                <span className="min-w-0 break-words text-muted">
+                  <b className="text-text">posting uploader</b>{" "}
+                  <span className="text-dim">{diagnostics.uploader.mode}</span>{" "}
+                  <span className={diagnostics.uploader.ok ? "text-dim" : "text-amber"}>
+                    — {diagnostics.uploader.detail}
+                  </span>
+                </span>
+              </li>
+            ) : null}
+            {diagnostics.at ? (
+              <li className="mono-num pt-1 text-[9.5px] tracking-[0.12em] text-dim uppercase">
+                checked {diagnostics.at}
+              </li>
+            ) : null}
+          </ul>
+        ) : null}
+      </div>
+
       {/* recipe summary */}
       <div
         className="border border-line bg-panel/50 p-4"
@@ -344,7 +474,7 @@ export function SourcePanel({
       >
         <div className="flex items-center justify-between gap-2">
           <p className="mono-num text-[10px] tracking-[0.24em] text-dim uppercase">
-            02 · caption recipe
+03 · caption recipe
           </p>
           <button
             type="button"

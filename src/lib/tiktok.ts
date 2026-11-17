@@ -1,188 +1,478 @@
+/**
+ * The desk's fetch engine.
+ *
+ * Every read of TikTok goes through here and every read has a fallback:
+ *
+ *   search   tikwm /feed/search  →  #hashtag variants  →  tiktok.com tag page
+ *   links    tikwm /api/         →  tiktok.com embed  →  video page  →  oEmbed
+ *   firehose tikwm /feed/list    →  tikwm search "fyp"
+ *   enrich   tikwm /api/         →  tiktok.com embed  →  video page
+ *
+ * Each attempt is recorded so the UI can say *which* upstream failed and why,
+ * instead of the old "Nothing came back".
+ */
+
 import type { FetchMode, TikTokVideo } from "./types";
 import { makeVideo } from "./video-factory";
+import { type Attempt, UpstreamError, shortError, withTimeout } from "./providers/net";
+import {
+  fromTikwm,
+  tikwmDetail,
+  tikwmFeed,
+  tikwmPing,
+  tikwmSearch,
+  tikwmUserPosts,
+  tikwmConfiguredBase,
+} from "./providers/tikwm";
+import {
+  extractUsername,
+  extractVideoId,
+  expandShortLink,
+  resolveWebVideo,
+  tagPage,
+  webPing,
+} from "./providers/tiktok-web";
+import {
+  fromAny,
+  sidecarCheck,
+  sidecarSearch,
+  sidecarTag,
+  sidecarUrl,
+  sidecarVideo,
+} from "./providers/sidecar";
 
-const TIKWM = "https://www.tikwm.com";
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+export { UpstreamError } from "./providers/net";
 
-export class UpstreamError extends Error {
-  detail: string;
-  constructor(message: string, detail = "") {
-    super(message);
-    this.name = "UpstreamError";
-    this.detail = detail;
+/* ── query shaping ─────────────────────────────────────────────── */
+
+export function tagFromKeyword(keyword: string): string {
+  return keyword
+    .toLowerCase()
+    .replace(/^#+/, "")
+    .replace(/[^a-z0-9\u00C0-\u024F_]/g, "")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 60);
+}
+
+/** Ordered hashtag candidates — used for `matchedTag` labels and the fallback. */
+export function tagCandidates(keyword: string): string[] {
+  const clean = keyword.trim().toLowerCase().replace(/^@/, "");
+  const out: string[] = [];
+  const push = (value: string) => {
+    const tag = tagFromKeyword(value);
+    if (tag && !out.includes(tag)) out.push(tag);
+  };
+  push(clean);
+  const words = clean.split(/[\s_-]+/).filter((word) => word.length > 2);
+  if (words.length > 1) {
+    push(words.join(""));
+    words.forEach(push);
   }
+  return out.slice(0, 4);
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-type CacheEntry = { at: number; value: unknown };
-const cache = new Map<string, CacheEntry>();
-const CACHE_TTL = 45_000;
-
-function cached<T>(key: string, ttl = CACHE_TTL): T | null {
-  const hit = cache.get(key);
-  if (!hit) return null;
-  if (Date.now() - hit.at > ttl) {
-    cache.delete(key);
-    return null;
+/** What we actually send to the search API, most relevant first. */
+export function searchQueries(keyword: string): { text: string; tag: string }[] {
+  const raw = keyword.trim().replace(/\s+/g, " ");
+  if (!raw) return [];
+  if (raw.startsWith("@")) {
+    return [{ text: raw, tag: raw.replace(/^@/, "").toLowerCase() }];
   }
-  return hit.value as T;
+  const out: { text: string; tag: string }[] = [];
+  const push = (text: string) => {
+    const value = text.trim();
+    if (!value) return;
+    if (out.some((entry) => entry.text.toLowerCase() === value.toLowerCase())) return;
+    out.push({ text: value, tag: tagFromKeyword(value) || value.toLowerCase() });
+  };
+
+  push(raw);
+  const words = raw.split(/[\s_-]+/).filter(Boolean);
+  if (words.length > 1) push(`#${words.map((word) => tagFromKeyword(word)).filter(Boolean).join("")}`);
+  else push(`#${tagFromKeyword(raw)}`);
+  if (words.length > 1) push(words[0]);
+  return out.slice(0, 3);
 }
 
-function remember(key: string, value: unknown) {
-  cache.set(key, { at: Date.now(), value });
-  if (cache.size > 120) {
-    const oldest = [...cache.keys()].slice(0, 20);
-    oldest.forEach((k) => cache.delete(k));
-  }
+function clampCount(value: number | undefined, fallback = 12) {
+  return Math.min(30, Math.max(1, Math.round(value ?? fallback) || fallback));
 }
 
-/* tikwm's free tier tolerates roughly one call a second; spacing requests here
-   keeps batches of links and scan pages from being dropped. */
-let lastCallAt = 0;
-const MIN_SPACING_MS = 720;
-
-async function throttle() {
-  const wait = Math.min(5000, Math.max(0, lastCallAt + MIN_SPACING_MS - Date.now()));
-  if (wait > 0) await sleep(wait);
-  lastCallAt = Date.now();
+function engagement(video: TikTokVideo) {
+  return (video.diggCount ?? 0) + (video.playCount ?? 0) / 100;
 }
 
-const TRANSIENT = /oops|try again|error occurred|timeout|too many|rate/i;
+function trim(text: string, max = 110) {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
 
-/** tikwm only answers reliably to form-encoded POSTs on these paths. */
-async function postForm(
-  path: string,
-  form: Record<string, string | number>,
-  timeoutMs = 22_000,
-  attempts = 3,
-): Promise<any> {
-  const body = new URLSearchParams();
-  for (const [key, value] of Object.entries(form)) body.set(key, String(value));
-  let lastMessage = "Upstream did not answer";
+/* ── search ───────────────────────────────────────────────────── */
 
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    await throttle();
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const res = await fetch(`${TIKWM}${path}`, {
-        method: "POST",
-        signal: controller.signal,
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          "User-Agent": UA,
-          Accept: "application/json",
-        },
-        body: body.toString(),
-        cache: "no-store",
-      });
-      const text = await res.text();
-      if (text.trimStart().startsWith("<")) {
-        throw new UpstreamError(
-          "Upstream is behind a bot challenge right now",
-          `challenge on ${path}`,
-        );
-      }
-      let json: any;
-      try {
-        json = JSON.parse(text);
-      } catch {
-        throw new UpstreamError("Upstream returned malformed data", text.slice(0, 160));
-      }
-      if (json?.code === 0) return json.data;
+export type SearchOutcome = {
+  videos: TikTokVideo[];
+  tagsTried: { tag: string; found: number }[];
+  attempts: Attempt[];
+  headline: string | null;
+  upstream: string;
+  notice: string;
+  degraded: boolean;
+};
 
-      const msg = String(json?.msg ?? `code ${json?.code ?? "?"}`);
-      lastMessage = msg;
-      // Permanent client errors are not worth retrying.
-      if (!TRANSIENT.test(msg)) throw new UpstreamError(msg, path);
-    } catch (err) {
-      if (err instanceof UpstreamError && !TRANSIENT.test(err.message)) throw err;
-      lastMessage = err instanceof Error ? err.message : String(err);
-    } finally {
-      clearTimeout(timer);
+export async function searchClips(opts: {
+  keyword: string;
+  count?: number;
+  region?: string;
+}): Promise<SearchOutcome> {
+  const keyword = opts.keyword.trim();
+  const count = clampCount(opts.count, 12);
+  const region = (opts.region ?? "US").toUpperCase();
+  const attempts: Attempt[] = [];
+  const tagsTried: { tag: string; found: number }[] = [];
+  const byId = new Map<string, TikTokVideo>();
+  let headline: string | null = null;
+  let degraded = false;
+  let upstream = `tikwm ${tikwmConfiguredBase()} /feed/search`;
+  /** Routed fetch has to answer inside the request window. */
+  const deadline = Date.now() + 45_000;
+  const outOfTime = () => Date.now() > deadline;
+
+  const add = (videos: TikTokVideo[], tag: string) => {
+    let fresh = 0;
+    for (const video of videos) {
+      if (byId.has(video.id)) continue;
+      video.matchedTag = tag;
+      byId.set(video.id, video);
+      fresh += 1;
     }
-    if (attempt < attempts) await sleep(700 * attempt);
+    tagsTried.push({ tag, found: fresh });
+    return fresh;
+  };
+
+  /* @handle → that creator's recent clips */
+  if (keyword.startsWith("@")) {
+    const username = keyword.replace(/^@/, "").trim();
+    const started = Date.now();
+    try {
+      const page = await withTimeout(
+        tikwmUserPosts({ uniqueId: username, count }),
+        18_000,
+        "tikwm user posts",
+      );
+      const videos = page.raw
+        .map((raw) => fromTikwm(raw, "search"))
+        .filter((video): video is TikTokVideo => Boolean(video));
+      add(videos, username.toLowerCase());
+      attempts.push({
+        provider: "tikwm user posts",
+        query: `@${username}`,
+        found: videos.length,
+        ms: Date.now() - started,
+      });
+    } catch (err) {
+      attempts.push({
+        provider: "tikwm user posts",
+        query: `@${username}`,
+        found: 0,
+        error: trim(shortError(err)),
+        ms: Date.now() - started,
+      });
+      degraded = true;
+    }
+  } else {
+    /* keyword / hashtag search: optional sidecar → tikwm → hashtag page */
+    const sidecarReady = Boolean(sidecarUrl());
+    let sidecarDead = false;
+    let tikwmDead = false;
+
+    for (const query of searchQueries(keyword)) {
+      if (byId.size >= count || outOfTime()) break;
+
+      if (sidecarReady && !sidecarDead) {
+        const started = Date.now();
+        try {
+          const videos = await withTimeout(
+            sidecarSearch({ query: query.text, count, region }),
+            18_000,
+            "sidecar search",
+          );
+          const fresh = add(videos, query.tag);
+          attempts.push({
+            provider: "sidecar search",
+            query: query.text,
+            found: fresh,
+            ms: Date.now() - started,
+          });
+          if (videos.length) upstream = "self-hosted sidecar";
+        } catch (err) {
+          const message = shortError(err);
+          attempts.push({
+            provider: "sidecar search",
+            query: query.text,
+            found: 0,
+            error: trim(message),
+            ms: Date.now() - started,
+          });
+          degraded = true;
+          sidecarDead = true;
+        }
+      }
+
+      if (byId.size >= count || tikwmDead) continue;
+
+      const started = Date.now();
+      try {
+        const page = await withTimeout(
+          tikwmSearch({ keywords: query.text, count, region, timeoutMs: 12_000, attempts: 1 }),
+          15_000,
+          "tikwm search",
+        );
+        const videos = page.raw
+          .map((raw) => fromTikwm(raw, "search"))
+          .filter((video): video is TikTokVideo => Boolean(video));
+        const fresh = add(videos, query.tag);
+        attempts.push({
+          provider: "tikwm search",
+          query: query.text,
+          found: fresh,
+          ms: Date.now() - started,
+        });
+      } catch (err) {
+        const message = shortError(err);
+        attempts.push({
+          provider: "tikwm search",
+          query: query.text,
+          found: 0,
+          error: trim(message),
+          ms: Date.now() - started,
+        });
+        degraded = true;
+        if (/reach|timed out|challenge|malformed|refused/i.test(message)) tikwmDead = true;
+      }
+    }
+
+    /* fall back to reading a hashtag in full */
+    if (!byId.size) {
+      for (const tag of tagCandidates(keyword).slice(0, 2)) {
+        const started = Date.now();
+        try {
+          const videos =
+            sidecarReady && !sidecarDead
+              ? await withTimeout(sidecarTag({ tag, count }), 18_000, "sidecar tag")
+              : [];
+          if (videos.length) {
+            const fresh = add(videos, tag);
+            attempts.push({
+              provider: "sidecar tag",
+              query: `#${tag}`,
+              found: fresh,
+              ms: Date.now() - started,
+            });
+            upstream = "self-hosted sidecar";
+            continue;
+          }
+        } catch (err) {
+          attempts.push({
+            provider: "sidecar tag",
+            query: `#${tag}`,
+            found: 0,
+            error: trim(shortError(err)),
+            ms: Date.now() - started,
+          });
+          sidecarDead = true;
+        }
+
+        const pageStarted = Date.now();
+        try {
+          const page = await withTimeout(tagPage(tag), 15_000, "tiktok.com tag page");
+          const fresh = add(page.videos, tag);
+          headline = headline ?? page.headline;
+          attempts.push({
+            provider: "tiktok.com tag page",
+            query: `#${tag}`,
+            found: fresh,
+            ms: Date.now() - pageStarted,
+          });
+          if (page.videos.length && upstream.startsWith("tikwm")) upstream = "tiktok.com tag pages";
+        } catch (err) {
+          attempts.push({
+            provider: "tiktok.com tag page",
+            query: `#${tag}`,
+            found: 0,
+            error: trim(shortError(err)),
+            ms: Date.now() - pageStarted,
+          });
+          degraded = true;
+        }
+      }
+    }
   }
 
-  throw new UpstreamError(lastMessage, path);
+  const videos = [...byId.values()]
+    .sort((a, b) => engagement(b) - engagement(a))
+    .slice(0, count)
+    .map((video, index) => ({ ...video, rank: index }));
+
+  let notice: string;
+  if (videos.length) {
+    const hit = tagsTried.filter((entry) => entry.found > 0).map((entry) => `#${entry.tag}`);
+    notice = `${videos.length} clip${videos.length === 1 ? "" : "s"}${
+      hit.length ? ` from ${hit.slice(0, 3).join(", ")}` : ""
+    }${videos.length < count ? " — that is everything public right now" : ""}.`;
+    if (degraded) notice += " One upstream had to be skipped.";
+  } else if (!attempts.length) {
+    notice = "Type a keyword or #hashtag to search.";
+  } else {
+    notice = `No clips for “${keyword}”. ${attempts
+      .map((entry) => `${entry.provider}: ${entry.error ?? "0 hits"}`)
+      .join(" · ")} — try another spelling, paste links in Link grab, or run diagnostics in fetch health.`;
+  }
+
+  return {
+    videos,
+    tagsTried,
+    attempts,
+    headline,
+    upstream,
+    notice: trim(notice, 420),
+    degraded,
+  };
 }
 
-function num(value: unknown): number | null {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
+/* ── links ────────────────────────────────────────────────────── */
+
+export type ResolvedLink = { video: TikTokVideo; provider: string };
+export type LinkOutcome = {
+  videos: TikTokVideo[];
+  failures: { link: string; reason: string }[];
+  attempts: Attempt[];
+  providers: string[];
+  degraded: boolean;
+};
+
+export async function resolveLink(url: string): Promise<ResolvedLink> {
+  const trimmed = url.trim();
+  if (!trimmed) throw new UpstreamError("Empty link");
+
+  const errors: string[] = [];
+
+  if (sidecarUrl()) {
+    try {
+      const video = await withTimeout(
+        sidecarVideo({ id: extractVideoId(trimmed) ?? undefined, url: trimmed }),
+        16_000,
+        "sidecar video",
+      );
+      if (video) return { video: fromAny(video, "link") ?? video, provider: "sidecar" };
+      errors.push("sidecar returned no clip");
+    } catch (err) {
+      errors.push(`sidecar: ${shortError(err)}`);
+    }
+  }
+
+  try {
+    const raw = await withTimeout(
+      tikwmDetail(trimmed, true, { timeoutMs: 12_000, attempts: 1 }),
+      15_000,
+      "tikwm",
+    );
+    const video = fromTikwm(raw, "link");
+    if (video && (video.playUrl || video.hdPlayUrl || video.coverUrl)) {
+      return { video, provider: "tikwm" };
+    }
+    errors.push("tikwm returned no media");
+  } catch (err) {
+    errors.push(`tikwm: ${shortError(err)}`);
+  }
+
+  const expanded = await expandShortLink(trimmed);
+  const id = extractVideoId(expanded) ?? extractVideoId(trimmed);
+  if (id) {
+    try {
+      const video = await withTimeout(
+        resolveWebVideo(id, {
+          username: extractUsername(expanded) ?? extractUsername(trimmed),
+          oembedUrl: expanded,
+        }),
+        22_000,
+        "tiktok.com",
+      );
+      if (video) return { video, provider: "tiktok.com" };
+    } catch (err) {
+      errors.push(`tiktok.com: ${shortError(err)}`);
+    }
+  } else {
+    errors.push("that URL has no video id in it");
+  }
+
+  throw new UpstreamError(
+    "That link did not resolve to a video",
+    errors.slice(0, 2).join(" · "),
+    "link",
+  );
 }
 
-function normalise(raw: any, source: FetchMode, base?: TikTokVideo): TikTokVideo | null {
-  if (!raw) return null;
-  const id = String(raw.id ?? raw.video_id ?? raw.aweme_id ?? "").trim();
-  if (!id) return null;
-  const author = raw.author ?? {};
-  const music = raw.music_info ?? raw.music ?? {};
-  const username = String(author.unique_id ?? author.uniqueId ?? "").trim();
-  const nickname = String(author.nickname ?? author.nick_name ?? "").trim();
-  const cover = raw.cover ?? raw.origin_cover ?? null;
-  const playUrl = raw.play ? absolutise(raw.play) : null;
-  const shareUrl =
-    raw.share_url ??
-    (username
-      ? `https://www.tiktok.com/@${username}/video/${id}`
-      : `https://www.tiktok.com/video/${id}`);
-  const created = num(raw.create_time);
+export async function resolveLinks(links: string[]): Promise<LinkOutcome> {
+  const videos: TikTokVideo[] = [];
+  const failures: { link: string; reason: string }[] = [];
+  const attempts: Attempt[] = [];
+  const providers = new Set<string>();
+  let degraded = false;
 
-  return makeVideo({
-    ...(base ?? {}),
-    id,
-    caption: base?.caption?.trim() ? base.caption : String(raw.title ?? "").trim(),
-    authorUsername: username || base?.authorUsername || "unknown",
-    authorNickname: nickname || username || base?.authorNickname || "unknown creator",
-    authorAvatar: author.avatar ?? base?.authorAvatar ?? null,
-    coverUrl: cover ? absolutise(cover) : base?.coverUrl ?? null,
-    originCoverUrl: raw.origin_cover ? absolutise(raw.origin_cover) : base?.originCoverUrl ?? null,
-    playUrl: playUrl ?? base?.playUrl ?? null,
-    ttPlayUrl: base?.ttPlayUrl ?? playUrl,
-    hdPlayUrl: raw.hdplay ? absolutise(raw.hdplay) : playUrl,
-    wmPlayUrl: raw.wmplay ? absolutise(raw.wmplay) : null,
-    shareUrl,
-    musicTitle: music.title ? String(music.title) : base?.musicTitle ?? null,
-    musicAuthor: music.author ? String(music.author) : base?.musicAuthor ?? null,
-    musicUrl: music.play ? absolutise(music.play) : null,
-    durationSec: num(raw.duration) ?? base?.durationSec ?? null,
-    region: raw.region ? String(raw.region) : base?.region ?? null,
-    postedAt: created ? new Date(created * 1000).toISOString() : base?.postedAt ?? null,
-    playCount: num(raw.play_count) ?? base?.playCount ?? null,
-    diggCount: num(raw.digg_count) ?? base?.diggCount ?? null,
-    commentCount: num(raw.comment_count) ?? base?.commentCount ?? null,
-    shareCount: num(raw.share_count) ?? base?.shareCount ?? null,
-    source: base?.source ?? source,
-    matchedTag: base?.matchedTag ?? null,
-    fetchedAt: new Date().toISOString(),
-    enriched: true,
-    rank: base?.rank ?? 0,
-  });
+  const deadline = Date.now() + 55_000;
+
+  for (const [index, link] of links.entries()) {
+    const started = Date.now();
+    if (Date.now() > deadline) {
+      failures.push({ link, reason: "ran out of time — split the batch" });
+      continue;
+    }
+    try {
+      const resolved = await resolveLink(link);
+      resolved.video.source = "link";
+      resolved.video.rank = videos.length;
+      providers.add(resolved.provider);
+      videos.push(resolved.video);
+      attempts.push({
+        provider: resolved.provider,
+        query: link,
+        found: 1,
+        ms: Date.now() - started,
+      });
+    } catch (err) {
+      degraded = true;
+      const reason = shortError(err);
+      failures.push({ link, reason: trim(reason, 160) });
+      attempts.push({
+        provider: "link resolve",
+        query: link,
+        found: 0,
+        error: trim(reason),
+        ms: Date.now() - started,
+      });
+    }
+    if (index < links.length - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    }
+  }
+
+  return {
+    videos,
+    failures,
+    attempts,
+    providers: [...providers],
+    degraded,
+  };
 }
 
-/** tikwm sometimes answers with protocol-relative or bare paths. */
-function absolutise(url: string): string {
-  if (!url) return url;
-  if (url.startsWith("//")) return `https:${url}`;
-  if (url.startsWith("/")) return `${TIKWM}${url}`;
-  return url;
-}
-
-function itemsOf(data: any): any[] {
-  if (Array.isArray(data)) return data;
-  if (Array.isArray(data?.videos)) return data.videos;
-  if (Array.isArray(data?.item_list)) return data.item_list;
-  if (data && typeof data === "object" && (data.id || data.video_id)) return [data];
-  return [];
-}
+/* ── firehose ─────────────────────────────────────────────────── */
 
 export type FirehosePage = {
   videos: TikTokVideo[];
   nextCursor: number;
   hasMore: boolean;
+  upstream: string;
+  notice: string;
+  degraded: boolean;
 };
 
 export async function fetchFirehose(opts: {
@@ -191,103 +481,292 @@ export async function fetchFirehose(opts: {
   count?: number;
 }): Promise<FirehosePage> {
   const region = (opts.region || "US").toUpperCase();
-  const count = Math.min(30, Math.max(1, opts.count ?? 20));
-  const cursor = Math.max(0, opts.cursor ?? 0);
-  const key = `feed:${region}:${cursor}:${count}`;
-  const hit = cached<FirehosePage>(key, 60_000);
-  if (hit) return hit;
+  const count = clampCount(opts.count, 20);
+  const cursor = Math.max(0, Math.round(opts.cursor ?? 0));
 
-  const data = await postForm("/api/feed/list", { region, count, cursor });
-  const list = itemsOf(data);
-  const videos = list
-    .map((raw) => normalise(raw, "firehose"))
-    .filter((v): v is TikTokVideo => Boolean(v));
-  const page: FirehosePage = {
-    videos,
-    nextCursor: cursor + count,
-    hasMore: videos.length > 0,
-  };
-  remember(key, page);
-  return page;
-}
-
-export async function resolveLink(url: string): Promise<TikTokVideo> {
-  const trimmed = url.trim();
-  if (!trimmed) throw new UpstreamError("Empty link");
-  const key = `link:${trimmed}`;
-  const hit = cached<TikTokVideo>(key, 120_000);
-  if (hit) return hit;
-
-  const data = await postForm("/api/", { url: trimmed, hd: 1, count: 1 });
-  const video = normalise(itemsOf(data)[0] ?? data, "link");
-  if (!video) throw new UpstreamError("That link did not resolve to a video", trimmed);
-  remember(key, video);
-  return video;
-}
-
-export async function resolveLinks(links: string[]): Promise<{
-  videos: TikTokVideo[];
-  failures: { link: string; reason: string }[];
-}> {
-  const videos: TikTokVideo[] = [];
-  const failures: { link: string; reason: string }[] = [];
-  for (const [index, link] of links.entries()) {
-    if (index > 0) await sleep(140);
-    try {
-      videos.push(await resolveLink(link));
-    } catch (err) {
-      failures.push({
-        link,
-        reason: err instanceof Error ? err.message : "unknown error",
-      });
+  try {
+    const page = await withTimeout(
+      tikwmFeed({ region, count, cursor, timeoutMs: 12_000, attempts: 1 }),
+      15_000,
+      "tikwm feed",
+    );
+    const videos = page.raw
+      .map((raw) => fromTikwm(raw, "firehose"))
+      .filter((video): video is TikTokVideo => Boolean(video))
+      .map((video, index) => ({ ...video, rank: cursor + index }));
+    if (videos.length) {
+      return {
+        videos,
+        nextCursor: page.cursor,
+        hasMore: true,
+        upstream: `tikwm ${tikwmConfiguredBase()} /feed/list`,
+        notice: `${videos.length} trending clips from ${region}.`,
+        degraded: false,
+      };
     }
+  } catch {
+    /* fall through to the search-backed firehose */
   }
-  return { videos, failures };
+
+  const fallback = await searchClips({ keyword: "fyp", count, region });
+  return {
+    videos: fallback.videos,
+    nextCursor: cursor + count,
+    hasMore: fallback.videos.length > 0,
+    upstream: "tikwm search “fyp” (firehose fallback)",
+    notice: fallback.videos.length
+      ? `The region feed was empty, so these are the busiest #fyp clips instead.`
+      : `Nothing came back: ${fallback.notice}`,
+    degraded: true,
+  };
 }
+
+/* ── enrich ───────────────────────────────────────────────────── */
+
+export type EnrichOutcome = {
+  video: TikTokVideo;
+  enriched: boolean;
+  provider: string | null;
+  reason: string | null;
+};
 
 /**
- * Enrich one clip (usually a search hit) with a watermark-free MP4 + HD link
- * from tikwm. Search results already carry metadata, so this is additive.
+ * Swap in a watermark-free MP4 / HD link for a clip found by search. Search
+ * results already carry metadata, so a failure here is never fatal — it just
+ * leaves the clip as it was and says why.
  */
-export async function enrichVideo(base: TikTokVideo): Promise<TikTokVideo> {
-  const key = `link:${base.shareUrl}`;
-  const hit = cached<TikTokVideo>(key, 180_000);
-  if (hit) return hit;
-  try {
-    const data = await postForm("/api/", { url: base.shareUrl, hd: 1, count: 1 }, 25_000, 2);
-    const merged = normalise(itemsOf(data)[0] ?? data, base.source, base);
-    if (!merged) throw new UpstreamError("No data returned for that clip");
-    remember(key, merged);
-    return merged;
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "enrich failed";
-    throw new UpstreamError(
-      `Could not resolve a watermark-free file (${message})`,
-      base.id,
-    );
+export async function enrichVideo(base: TikTokVideo): Promise<EnrichOutcome> {
+  const reasons: string[] = [];
+  /** Serverless functions get killed around 60s — leave room to answer. */
+  const deadline = Date.now() + 32_000;
+  const outOfTime = () => Date.now() > deadline;
+
+  if (sidecarUrl() && !outOfTime()) {
+    try {
+      const viaSidecar = await withTimeout(
+        sidecarVideo({ id: base.id, url: base.shareUrl }),
+        14_000,
+        "sidecar video",
+      );
+      if (viaSidecar && (viaSidecar.playUrl || viaSidecar.hdPlayUrl)) {
+        return {
+          video: makeVideo({
+            ...base,
+            playUrl: viaSidecar.playUrl ?? base.playUrl,
+            hdPlayUrl: viaSidecar.hdPlayUrl ?? base.hdPlayUrl,
+            ttPlayUrl: viaSidecar.ttPlayUrl ?? base.ttPlayUrl,
+            enriched: true,
+          }),
+          enriched: true,
+          provider: "sidecar",
+          reason: null,
+        };
+      }
+      reasons.push("sidecar returned no file");
+    } catch (err) {
+      reasons.push(`sidecar: ${shortError(err)}`);
+    }
   }
+
+  if (outOfTime()) {
+    reasons.push("ran out of time before tikwm");
+  } else {
+    try {
+      const raw = await withTimeout(
+        tikwmDetail(base.shareUrl, true, { timeoutMs: 10_000, attempts: 1 }),
+        13_000,
+        "tikwm",
+      );
+      const merged = fromTikwm(raw, base.source, base);
+      if (merged && (merged.playUrl || merged.hdPlayUrl)) {
+        return {
+          video: makeVideo({
+            ...merged,
+            caption: base.caption || merged.caption,
+            matchedTag: base.matchedTag,
+            rank: base.rank,
+            source: base.source,
+          }),
+          enriched: true,
+          provider: "tikwm",
+          reason: null,
+        };
+      }
+      reasons.push("tikwm returned no file");
+    } catch (err) {
+      reasons.push(`tikwm: ${shortError(err)}`);
+    }
+  }
+
+  if (outOfTime()) {
+    reasons.push("ran out of time before tiktok.com");
+  } else {
+    try {
+      const web = await withTimeout(
+        resolveWebVideo(base.id, {
+          username: base.authorUsername === "unknown" ? null : base.authorUsername,
+          oembedUrl: base.shareUrl,
+        }),
+        16_000,
+        "tiktok.com",
+      );
+      if (web?.playUrl || web?.hdPlayUrl) {
+        return {
+          video: makeVideo({
+            ...base,
+            playUrl: web.playUrl ?? base.playUrl,
+            hdPlayUrl: web.hdPlayUrl ?? base.hdPlayUrl,
+            ttPlayUrl: web.ttPlayUrl ?? base.ttPlayUrl,
+            coverUrl: base.coverUrl ?? web.coverUrl,
+            durationSec: base.durationSec ?? web.durationSec,
+            enriched: true,
+          }),
+          enriched: true,
+          provider: "tiktok.com",
+          reason: null,
+        };
+      }
+      reasons.push("tiktok.com had no playable file");
+    } catch (err) {
+      reasons.push(`tiktok.com: ${shortError(err)}`);
+    }
+  }
+
+  return {
+    video: base,
+    enriched: Boolean(base.playUrl || base.ttPlayUrl),
+    provider: null,
+    reason: trim(reasons.join(" · "), 240) || "no upstream answered",
+  };
 }
+
+/* ── health / diagnostics ─────────────────────────────────────── */
+
+export type ProviderCheck = {
+  id: string;
+  label: string;
+  ok: boolean;
+  latencyMs: number;
+  detail: string;
+};
 
 export async function pingUpstream(): Promise<{
   ok: boolean;
   latencyMs: number;
   detail: string;
+  providers: ProviderCheck[];
 }> {
-  const started = Date.now();
-  try {
-    const page = await fetchFirehose({ region: "US", count: 1 });
-    return {
-      ok: page.videos.length > 0,
-      latencyMs: Date.now() - started,
-      detail: page.videos.length ? "live" : "empty response",
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      latencyMs: Date.now() - started,
-      detail: err instanceof Error ? err.message : "unreachable",
-    };
+  const [sidecar, tikwm, web] = await Promise.all([sidecarCheck(), tikwmPing(), webPing()]);
+  const providers: ProviderCheck[] = [];
+  if (sidecarUrl()) {
+    providers.push({
+      id: "sidecar",
+      label: `sidecar ${sidecarUrl()}`,
+      ok: sidecar.ok,
+      latencyMs: sidecar.latencyMs,
+      detail: sidecar.detail,
+    });
   }
+  providers.push(
+    {
+      id: "tikwm",
+      label: `tikwm ${tikwm.base}`,
+      ok: tikwm.ok,
+      latencyMs: tikwm.latencyMs,
+      detail: tikwm.detail,
+    },
+    {
+      id: "tiktok-web",
+      label: "tiktok.com (direct reads)",
+      ok: web.ok,
+      latencyMs: web.latencyMs,
+      detail: web.detail,
+    },
+  );
+  return {
+    ok: providers.some((provider) => provider.ok),
+    latencyMs: Math.max(...providers.map((provider) => provider.latencyMs)),
+    detail: providers
+      .map((provider) => `${provider.id} ${provider.ok ? "live" : "down"}`)
+      .join(" · "),
+    providers,
+  };
 }
 
-export { REGIONS, extractTikTokLinks, proxiedMedia } from "./tiktok-client";
+/** One-shot health sweep used by /api/tiktok/diagnostics. */
+export async function describeProviders(): Promise<ProviderCheck[]> {
+  const checks: ProviderCheck[] = [];
+
+  const [sidecar, tikwm, web] = await Promise.all([sidecarCheck(), tikwmPing(), webPing()]);
+  if (sidecarUrl()) {
+    checks.push({
+      id: "sidecar",
+      label: `self-hosted fetch service (${sidecarUrl()})`,
+      ok: sidecar.ok,
+      latencyMs: sidecar.latencyMs,
+      detail: sidecar.detail,
+    });
+  }
+  checks.push({
+    id: "tikwm-feed",
+    label: `tikwm feed (${tikwm.base})`,
+    ok: tikwm.ok,
+    latencyMs: tikwm.latencyMs,
+    detail: tikwm.detail,
+  });
+  checks.push({
+    id: "tiktok-web",
+    label: "tiktok.com reachability",
+    ok: web.ok,
+    latencyMs: web.latencyMs,
+    detail: web.detail,
+  });
+
+  const searchStarted = Date.now();
+  try {
+    const page = await tikwmSearch({ keywords: "cat", count: 3 });
+    checks.push({
+      id: "tikwm-search",
+      label: "tikwm keyword search",
+      ok: page.raw.length > 0,
+      latencyMs: Date.now() - searchStarted,
+      detail: page.raw.length
+        ? `“cat” → ${page.raw.length} clips`
+        : "answering but no clips for “cat”",
+    });
+  } catch (err) {
+    checks.push({
+      id: "tikwm-search",
+      label: "tikwm keyword search",
+      ok: false,
+      latencyMs: Date.now() - searchStarted,
+      detail: shortError(err),
+    });
+  }
+
+  const tagStarted = Date.now();
+  try {
+    const page = await tagPage("cat");
+    checks.push({
+      id: "tiktok-tag",
+      label: "tiktok.com #tag page",
+      ok: page.videos.length > 0,
+      latencyMs: Date.now() - tagStarted,
+      detail: page.videos.length
+        ? `#cat → ${page.videos.length} clips`
+        : `page read, no inline clips${page.headline ? ` · “${trim(page.headline, 60)}”` : ""}`,
+    });
+  } catch (err) {
+    checks.push({
+      id: "tiktok-tag",
+      label: "tiktok.com #tag page",
+      ok: false,
+      latencyMs: Date.now() - tagStarted,
+      detail: shortError(err),
+    });
+  }
+
+  return checks;
+}
+
+export { REGIONS, extractTikTokLinks, proxiedMedia, smartMedia } from "./tiktok-client";

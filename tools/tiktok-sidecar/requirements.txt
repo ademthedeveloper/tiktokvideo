@@ -1,0 +1,5 @@
+# Open-source stack behind the sidecar — nothing here needs a TikTok developer app.
+fastapi>=0.115
+uvicorn[standard]>=0.32
+TikTokApi>=7.3.5
+playwright>=1.48

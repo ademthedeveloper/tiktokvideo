@@ -330,6 +330,7 @@ function StudioInner({
           count: incoming.length,
           at: clock(),
           tagsTried: data.tagsTried ?? [],
+          attempts: data.attempts ?? [],
           resolving: 0,
         });
 
@@ -366,7 +367,7 @@ function StudioInner({
             }
           }
         } else {
-          toast("Nothing came back", "warn", data.notice ?? "Try another tag or region");
+          toast("No clips matched", "warn", data.notice ?? "Try another tag, region, or Link grab");
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : "Fetch failed";
@@ -376,6 +377,7 @@ function StudioInner({
           appending: false,
           error: message,
           notice: null,
+          attempts: [],
           resolving: 0,
         }));
         toast("Fetch failed", "warn", message);

@@ -1,15 +1,15 @@
 import { NextResponse } from "next/server";
-import { searchTikTok } from "@/lib/tiktok-search";
 import {
   extractTikTokLinks,
   fetchFirehose,
   resolveLinks,
+  searchClips,
   UpstreamError,
 } from "@/lib/tiktok";
 import type { FetchMode } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 90;
+export const maxDuration = 60;
 
 export async function POST(request: Request) {
   let body: any = {};
@@ -25,7 +25,7 @@ export async function POST(request: Request) {
   const count = Math.min(30, Math.max(4, Number(body.count ?? 10) || 10));
 
   try {
-    /* ── real TikTok search via the crawler-facing tag pages ─────── */
+    /* ── keyword / hashtag / @handle search ──────────────────────── */
     if (mode === "search") {
       const keyword = String(body.keyword ?? "").trim();
       if (!keyword) {
@@ -34,16 +34,18 @@ export async function POST(request: Request) {
           { status: 400 },
         );
       }
-      const outcome = await searchTikTok({ keyword, count, region });
+      const outcome = await searchClips({ keyword, count, region });
       return NextResponse.json({
         videos: outcome.videos,
         nextCursor: 0,
         hasMore: false,
         mode,
-        upstream: "tiktok.com tag pages (JSON-LD)",
+        upstream: outcome.upstream,
         tagsTried: outcome.tagsTried,
+        attempts: outcome.attempts,
         headline: outcome.headline,
         notice: outcome.notice,
+        degraded: outcome.degraded,
       });
     }
 
@@ -62,20 +64,24 @@ export async function POST(request: Request) {
           { status: 400 },
         );
       }
-      const { videos, failures } = await resolveLinks(links.slice(0, 25));
+      const outcome = await resolveLinks(links.slice(0, 25));
+      const providerLabel = outcome.providers.length
+        ? outcome.providers.join(" + ")
+        : "tikwm / tiktok.com";
       return NextResponse.json({
-        videos,
+        videos: outcome.videos,
         nextCursor: 0,
         hasMore: false,
         mode,
-        upstream: "tikwm /api/",
-        failures,
-        notice: failures.length
-          ? `${videos.length} resolved, ${failures.length} failed: ${failures
-              .map((failure) => failure.reason)
-              .slice(0, 2)
-              .join(" · ")}`
-          : `${videos.length} clip${videos.length === 1 ? "" : "s"} resolved.`,
+        upstream: providerLabel,
+        attempts: outcome.attempts,
+        failures: outcome.failures,
+        degraded: outcome.degraded,
+        notice: outcome.videos.length
+          ? `${outcome.videos.length} clip${outcome.videos.length === 1 ? "" : "s"} resolved${
+              outcome.failures.length ? ` · ${outcome.failures.length} failed` : ""
+            }${outcome.failures.length ? `: ${outcome.failures[0].reason}` : ""}`
+          : `Nothing resolved. ${outcome.failures[0]?.reason ?? "Try a full tiktok.com link."}`,
       });
     }
 
@@ -86,10 +92,9 @@ export async function POST(request: Request) {
       nextCursor: page.nextCursor,
       hasMore: page.hasMore,
       mode,
-      upstream: "tikwm /api/feed/list",
-      notice: page.videos.length
-        ? undefined
-        : "The firehose returned nothing for that region — try another one.",
+      upstream: page.upstream,
+      notice: page.notice,
+      degraded: page.degraded,
     });
   } catch (err) {
     const message =
