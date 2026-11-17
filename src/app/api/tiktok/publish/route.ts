@@ -30,7 +30,7 @@ import type {
 } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 300;
+export const maxDuration = 60;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -339,8 +339,9 @@ export async function POST(request: Request) {
       publicPostIds: "",
       uploadedBytes: bytes.byteLength,
     };
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await sleep(3200);
+    // Keep the request inside a serverless window; the UI re-checks later.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await sleep(3000);
       try {
         latest = await fetchPublishStatus(auth.token, publishId);
       } catch {

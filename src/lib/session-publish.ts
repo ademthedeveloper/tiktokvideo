@@ -51,6 +51,20 @@ export type UploaderConfig = {
 
 const DEFAULT_COMMAND = "tiktok-uploader -v {file} -d {caption} -c {cookies}";
 
+/**
+ * Serverless hosts (Vercel, Lambda, Azure Functions) ship a read-only runtime
+ * with no Python and no browser, so they cannot launch the uploader binary.
+ * Detect it early and say so instead of failing with ENOENT.
+ */
+export function isServerlessRuntime(): boolean {
+  return Boolean(
+    process.env.VERCEL ||
+      process.env.AWS_LAMBDA_FUNCTION_NAME ||
+      process.env.FUNCTIONS_WORKER_RUNTIME ||
+      process.env.NETLIFY,
+  );
+}
+
 export function uploaderConfig(): UploaderConfig {
   const raw = (process.env.TIKTOK_UPLOAD_MODE ?? "auto").trim().toLowerCase();
   const requested: UploaderMode | "auto" =
@@ -269,7 +283,9 @@ export async function describeSession(): Promise<SessionStatus> {
           ? "Session uploads are switched off (TIKTOK_UPLOAD_MODE=off)."
           : config.mode === "http"
             ? `Uploads go to ${config.url}`
-            : `Uploads shell out to: ${config.command}`,
+            : isServerlessRuntime()
+              ? "This deployment is serverless, so it cannot launch the uploader. Run tiktok-uploader elsewhere and set TIKTOK_UPLOADER_URL (HTTP mode)."
+              : `Uploads shell out to: ${config.command}`,
     },
     instructions: [
       "Install the open-source uploader: pip install tiktok-uploader && playwright install chromium",
@@ -292,6 +308,16 @@ export async function probeUploader(): Promise<{
 
   if (config.mode === "off") {
     return { ok: false, mode: "off", detail: "session uploads disabled", latencyMs: 0 };
+  }
+
+  if (config.mode === "cli" && isServerlessRuntime()) {
+    return {
+      ok: false,
+      mode: "cli",
+      detail:
+        "serverless runtime cannot launch the uploader — set TIKTOK_UPLOADER_URL to an HTTP uploader, or post through the Content Posting API",
+      latencyMs: 0,
+    };
   }
 
   if (config.mode === "http") {
@@ -432,6 +458,14 @@ export async function uploadWithSession(input: SessionUploadInput): Promise<Sess
       "Session uploads are disabled",
       "session_disabled",
       "Set TIKTOK_UPLOAD_MODE=cli (or http) to enable them.",
+    );
+  }
+
+  if (config.mode === "cli" && isServerlessRuntime()) {
+    throw new SessionPublishError(
+      "This deployment is serverless and cannot launch the uploader",
+      "serverless_cli",
+      "Run tiktok-uploader on a normal machine/VPS and set TIKTOK_UPLOADER_URL (TIKTOK_UPLOAD_MODE=http), or connect a TikTok developer app for the official API.",
     );
   }
 

@@ -3,7 +3,7 @@ import { enrichVideo, UpstreamError } from "@/lib/tiktok";
 import type { TikTokVideo } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+export const maxDuration = 45;
 
 /** Swap in a watermark-free MP4 / HD link for a clip found by search. */
 export async function POST(request: Request) {

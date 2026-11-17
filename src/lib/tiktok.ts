@@ -133,7 +133,7 @@ export async function searchClips(opts: {
   let degraded = false;
   let upstream = `tikwm ${tikwmConfiguredBase()} /feed/search`;
   /** Routed fetch has to answer inside the request window. */
-  const deadline = Date.now() + 75_000;
+  const deadline = Date.now() + 45_000;
   const outOfTime = () => Date.now() > deadline;
 
   const add = (videos: TikTokVideo[], tag: string) => {
@@ -418,7 +418,7 @@ export async function resolveLinks(links: string[]): Promise<LinkOutcome> {
   const providers = new Set<string>();
   let degraded = false;
 
-  const deadline = Date.now() + 100_000;
+  const deadline = Date.now() + 55_000;
 
   for (const [index, link] of links.entries()) {
     const started = Date.now();
@@ -537,8 +537,11 @@ export type EnrichOutcome = {
  */
 export async function enrichVideo(base: TikTokVideo): Promise<EnrichOutcome> {
   const reasons: string[] = [];
+  /** Serverless functions get killed around 60s — leave room to answer. */
+  const deadline = Date.now() + 32_000;
+  const outOfTime = () => Date.now() > deadline;
 
-  if (sidecarUrl()) {
+  if (sidecarUrl() && !outOfTime()) {
     try {
       const viaSidecar = await withTimeout(
         sidecarVideo({ id: base.id, url: base.shareUrl }),
@@ -565,60 +568,68 @@ export async function enrichVideo(base: TikTokVideo): Promise<EnrichOutcome> {
     }
   }
 
-  try {
-    const raw = await withTimeout(
-      tikwmDetail(base.shareUrl, true, { timeoutMs: 10_000, attempts: 1 }),
-      13_000,
-      "tikwm",
-    );
-    const merged = fromTikwm(raw, base.source, base);
-    if (merged && (merged.playUrl || merged.hdPlayUrl)) {
-      return {
-        video: makeVideo({
-          ...merged,
-          caption: base.caption || merged.caption,
-          matchedTag: base.matchedTag,
-          rank: base.rank,
-          source: base.source,
-        }),
-        enriched: true,
-        provider: "tikwm",
-        reason: null,
-      };
+  if (outOfTime()) {
+    reasons.push("ran out of time before tikwm");
+  } else {
+    try {
+      const raw = await withTimeout(
+        tikwmDetail(base.shareUrl, true, { timeoutMs: 10_000, attempts: 1 }),
+        13_000,
+        "tikwm",
+      );
+      const merged = fromTikwm(raw, base.source, base);
+      if (merged && (merged.playUrl || merged.hdPlayUrl)) {
+        return {
+          video: makeVideo({
+            ...merged,
+            caption: base.caption || merged.caption,
+            matchedTag: base.matchedTag,
+            rank: base.rank,
+            source: base.source,
+          }),
+          enriched: true,
+          provider: "tikwm",
+          reason: null,
+        };
+      }
+      reasons.push("tikwm returned no file");
+    } catch (err) {
+      reasons.push(`tikwm: ${shortError(err)}`);
     }
-    reasons.push("tikwm returned no file");
-  } catch (err) {
-    reasons.push(`tikwm: ${shortError(err)}`);
   }
 
-  try {
-    const web = await withTimeout(
-      resolveWebVideo(base.id, {
-        username: base.authorUsername === "unknown" ? null : base.authorUsername,
-        oembedUrl: base.shareUrl,
-      }),
-      20_000,
-      "tiktok.com",
-    );
-    if (web?.playUrl || web?.hdPlayUrl) {
-      return {
-        video: makeVideo({
-          ...base,
-          playUrl: web.playUrl ?? base.playUrl,
-          hdPlayUrl: web.hdPlayUrl ?? base.hdPlayUrl,
-          ttPlayUrl: web.ttPlayUrl ?? base.ttPlayUrl,
-          coverUrl: base.coverUrl ?? web.coverUrl,
-          durationSec: base.durationSec ?? web.durationSec,
-          enriched: true,
+  if (outOfTime()) {
+    reasons.push("ran out of time before tiktok.com");
+  } else {
+    try {
+      const web = await withTimeout(
+        resolveWebVideo(base.id, {
+          username: base.authorUsername === "unknown" ? null : base.authorUsername,
+          oembedUrl: base.shareUrl,
         }),
-        enriched: true,
-        provider: "tiktok.com",
-        reason: null,
-      };
+        16_000,
+        "tiktok.com",
+      );
+      if (web?.playUrl || web?.hdPlayUrl) {
+        return {
+          video: makeVideo({
+            ...base,
+            playUrl: web.playUrl ?? base.playUrl,
+            hdPlayUrl: web.hdPlayUrl ?? base.hdPlayUrl,
+            ttPlayUrl: web.ttPlayUrl ?? base.ttPlayUrl,
+            coverUrl: base.coverUrl ?? web.coverUrl,
+            durationSec: base.durationSec ?? web.durationSec,
+            enriched: true,
+          }),
+          enriched: true,
+          provider: "tiktok.com",
+          reason: null,
+        };
+      }
+      reasons.push("tiktok.com had no playable file");
+    } catch (err) {
+      reasons.push(`tiktok.com: ${shortError(err)}`);
     }
-    reasons.push("tiktok.com had no playable file");
-  } catch (err) {
-    reasons.push(`tiktok.com: ${shortError(err)}`);
   }
 
   return {

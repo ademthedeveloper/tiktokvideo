@@ -209,7 +209,26 @@ API later without touching the desk.
 
 ---
 
-## 6. Troubleshooting
+## 6. Deploying to Vercel
+
+- **Set `DATABASE_URL`** in Project → Settings → Environment Variables (Postgres
+  from Neon/Supabase/Vercel Postgres). The build itself no longer needs it — the
+  pool is created on first query — but every queue/settings/session request does.
+- Without it the site still renders and returns graceful errors; `/api/health`
+  reports `ok: false`.
+- **Serverless cannot run the session uploader.** Vercel functions have no
+  Python/browser and a read-only runtime, so `TIKTOK_UPLOAD_MODE=cli` refuses
+  with a clear message. Either:
+  - run `tiktok-uploader` on a VPS/sidecar and set `TIKTOK_UPLOADER_URL` +
+    `TIKTOK_UPLOAD_MODE=http`, or
+  - connect a TikTok developer app and post through the official API, or
+  - host the desk itself on a VPS, where CLI mode works as-is.
+- **Vercel IPs are datacenter IPs** and are often rate-limited by tikwm /
+  tiktok.com. Run `run diagnostics`: if both public providers are red, point
+  `TIKTOK_FETCH_URL` at the sidecar (§4) running somewhere TikTok accepts, or
+  self-host the desk next to it.
+
+## 7. Troubleshooting
 
 | Symptom | Check |
 | --- | --- |
@@ -218,4 +237,6 @@ API later without touching the desk.
 | "The uploader command … was not found" | `pip install tiktok-uploader && playwright install chromium`, or set `TIKTOK_UPLOADER_CMD`. |
 | "No TikTok session stored" | Paste the `sessionid` on the Publish tab (browser must be logged in). |
 | Uploads fail with a login/expired error | Log in to tiktok.com again and re-paste the cookie. |
-| `DATABASE_URL is required` | Copy `.env.example` to `.env` and point it at Postgres. |
+| `DATABASE_URL is required` | Copy `.env.example` to `.env` and point it at Postgres; on Vercel add it to the project env vars. |
+| Build fails with `DATABASE_URL is required` | Fixed: the connection is lazy, so builds no longer need a database (this was the old behaviour). |
+| "serverless runtime cannot launch the uploader" | Expected on Vercel — use `TIKTOK_UPLOADER_URL` (HTTP mode) or the official API. |
