@@ -324,7 +324,7 @@ export async function searchClips(opts: {
   } else {
     notice = `No clips for “${keyword}”. ${attempts
       .map((entry) => `${entry.provider}: ${entry.error ?? "0 hits"}`)
-      .join(" · ")} — try another spelling, or paste links in Link grab.`;
+      .join(" · ")} — try another spelling, paste links in Link grab, or run diagnostics in fetch health.`;
   }
 
   return {
