@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { describeProviders } from "@/lib/tiktok";
 import { describeSession, probeUploader } from "@/lib/session-publish";
 import { tikwmConfiguredBase } from "@/lib/providers/tikwm";
+import { proxyUrl } from "@/lib/providers/net";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 90;
@@ -35,6 +36,7 @@ export async function GET() {
       sessionVerified: Boolean(session?.verified),
       tikwmBase: tikwmConfiguredBase(),
       cookieConfigured: Boolean(process.env.TIKTOK_COOKIE),
+      egressProxy: proxyUrl(),
     },
   });
 }

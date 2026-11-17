@@ -54,6 +54,34 @@ export function shortError(err: unknown): string {
   return String(err);
 }
 
+const PROXIED_HOSTS = /^https:\/\/(?:www\.)?(?:tikwm\.com|tikwmapi\.com|tiktok\.com)\//i;
+
+export function proxyUrl(): string | null {
+  const configured = process.env.TIKTOK_PROXY_URL?.trim();
+  return configured || null;
+}
+
+export function isProxyTarget(url: string): boolean {
+  return PROXIED_HOSTS.test(url);
+}
+
+/**
+ * Route a scraper request through an egress proxy when one is configured.
+ *
+ * Datacenter IPs (Vercel, Lambda, Fly) are routinely 403'd by Cloudflare, which
+ * is what tikwm sits behind. TIKTOK_PROXY_URL points at any service that accepts
+ * `?url=<target>` and returns the upstream body — see tools/tiktok-proxy-worker.
+ */
+function viaProxy(url: string): { url: string; headers: Record<string, string> } | null {
+  const proxy = proxyUrl();
+  if (!proxy || !isProxyTarget(url)) return null;
+  const separator = proxy.includes("?") ? "&" : "?";
+  const headers: Record<string, string> = {};
+  const secret = process.env.TIKTOK_PROXY_SECRET?.trim();
+  if (secret) headers["x-proxy-secret"] = secret;
+  return { url: `${proxy}${separator}url=${encodeURIComponent(url)}`, headers };
+}
+
 /** fetch() with a hard timeout and a normalised network error. */
 export async function request(
   url: string,
@@ -63,9 +91,15 @@ export async function request(
 ): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const proxied = viaProxy(url);
+  const headers = new Headers(init.headers);
+  if (proxied) {
+    for (const [key, value] of Object.entries(proxied.headers)) headers.set(key, value);
+  }
   try {
-    return await fetch(url, {
+    return await fetch(proxied?.url ?? url, {
       ...init,
+      headers,
       signal: controller.signal,
       cache: "no-store",
       redirect: init.redirect ?? "follow",

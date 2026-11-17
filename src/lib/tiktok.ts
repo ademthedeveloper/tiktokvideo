@@ -33,6 +33,12 @@ import {
   webPing,
 } from "./providers/tiktok-web";
 import {
+  challengeVideos,
+  creatorVideos,
+  videoDetail,
+  webApiCheck,
+} from "./providers/tiktok-api";
+import {
   fromAny,
   sidecarCheck,
   sidecarSearch,
@@ -178,6 +184,34 @@ export async function searchClips(opts: {
       });
       degraded = true;
     }
+
+    if (!byId.size && !outOfTime()) {
+      const apiStarted = Date.now();
+      try {
+        const videos = await withTimeout(
+          creatorVideos({ username, count }),
+          16_000,
+          "tiktok.com creator list",
+        );
+        add(videos, username.toLowerCase());
+        attempts.push({
+          provider: "tiktok.com api",
+          query: `@${username}`,
+          found: videos.length,
+          ms: Date.now() - apiStarted,
+        });
+        if (videos.length) upstream = "tiktok.com web api";
+      } catch (err) {
+        attempts.push({
+          provider: "tiktok.com api",
+          query: `@${username}`,
+          found: 0,
+          error: trim(shortError(err)),
+          ms: Date.now() - apiStarted,
+        });
+        degraded = true;
+      }
+    }
   } else {
     /* keyword / hashtag search: optional sidecar → tikwm → hashtag page */
     const sidecarReady = Boolean(sidecarUrl());
@@ -250,7 +284,38 @@ export async function searchClips(opts: {
       }
     }
 
-    /* fall back to reading a hashtag in full */
+    /* TikTok's own hashtag item list (no middleman, works from datacenter IPs) */
+    if (byId.size < count && !outOfTime()) {
+      for (const tag of tagCandidates(keyword).slice(0, 2)) {
+        if (byId.size >= count || outOfTime()) break;
+        const apiStarted = Date.now();
+        try {
+          const page = await withTimeout(
+            challengeVideos({ tag, count }),
+            16_000,
+            "tiktok.com hashtag list",
+          );
+          const fresh = add(page.videos, tag);
+          attempts.push({
+            provider: "tiktok.com api",
+            query: `#${tag}`,
+            found: fresh,
+            ms: Date.now() - apiStarted,
+          });
+          if (page.videos.length) upstream = "tiktok.com web api";
+        } catch (err) {
+          attempts.push({
+            provider: "tiktok.com api",
+            query: `#${tag}`,
+            found: 0,
+            error: trim(shortError(err)),
+            ms: Date.now() - apiStarted,
+          });
+        }
+      }
+    }
+
+    /* last resort: read the hashtag page itself */
     if (!byId.size) {
       for (const tag of tagCandidates(keyword).slice(0, 2)) {
         const started = Date.now();
@@ -322,9 +387,15 @@ export async function searchClips(opts: {
   } else if (!attempts.length) {
     notice = "Type a keyword or #hashtag to search.";
   } else {
+    const blocked = attempts.some((entry) =>
+      /bot-challenge|bot challenge|\b403\b|forbidden/i.test(entry.error ?? ""),
+    );
+    const hint = blocked
+      ? "tikwm is blocking this server's IP — deploy tools/tiktok-proxy-worker and set TIKTOK_PROXY_URL, or point TIKTOK_FETCH_URL at a sidecar."
+      : "try another spelling, paste links in Link grab, or run diagnostics in fetch health.";
     notice = `No clips for “${keyword}”. ${attempts
       .map((entry) => `${entry.provider}: ${entry.error ?? "0 hits"}`)
-      .join(" · ")} — try another spelling, paste links in Link grab, or run diagnostics in fetch health.`;
+      .join(" · ")} — ${hint}`;
   }
 
   return {
@@ -387,6 +458,16 @@ export async function resolveLink(url: string): Promise<ResolvedLink> {
   const expanded = await expandShortLink(trimmed);
   const id = extractVideoId(expanded) ?? extractVideoId(trimmed);
   if (id) {
+    try {
+      const viaApi = await withTimeout(videoDetail(id), 15_000, "tiktok.com api");
+      if (viaApi && (viaApi.playUrl || viaApi.coverUrl)) {
+        return { video: viaApi, provider: "tiktok.com api" };
+      }
+      errors.push("tiktok.com api returned no clip");
+    } catch (err) {
+      errors.push(`tiktok.com api: ${shortError(err)}`);
+    }
+
     try {
       const video = await withTimeout(
         resolveWebVideo(id, {
@@ -508,6 +589,23 @@ export async function fetchFirehose(opts: {
     /* fall through to the search-backed firehose */
   }
 
+  try {
+    const page = await withTimeout(challengeVideos({ tag: "fyp", count }), 16_000, "tiktok.com hashtag list");
+    const videos = page.videos.map((video, index) => ({ ...video, rank: cursor + index }));
+    if (videos.length) {
+      return {
+        videos,
+        nextCursor: cursor + count,
+        hasMore: page.hasMore,
+        upstream: "tiktok.com web api #fyp",
+        notice: `${videos.length} clips from TikTok's #fyp list.`,
+        degraded: true,
+      };
+    }
+  } catch {
+    /* fall through to search */
+  }
+
   const fallback = await searchClips({ keyword: "fyp", count, region });
   return {
     videos: fallback.videos,
@@ -595,6 +693,31 @@ export async function enrichVideo(base: TikTokVideo): Promise<EnrichOutcome> {
       reasons.push("tikwm returned no file");
     } catch (err) {
       reasons.push(`tikwm: ${shortError(err)}`);
+    }
+  }
+
+  if (!outOfTime()) {
+    try {
+      const viaApi = await withTimeout(videoDetail(base.id), 12_000, "tiktok.com api");
+      if (viaApi && (viaApi.playUrl || viaApi.hdPlayUrl)) {
+        return {
+          video: makeVideo({
+            ...base,
+            playUrl: viaApi.playUrl ?? base.playUrl,
+            hdPlayUrl: viaApi.hdPlayUrl ?? base.hdPlayUrl,
+            ttPlayUrl: viaApi.ttPlayUrl ?? base.ttPlayUrl,
+            coverUrl: base.coverUrl ?? viaApi.coverUrl,
+            durationSec: base.durationSec ?? viaApi.durationSec,
+            enriched: true,
+          }),
+          enriched: true,
+          provider: "tiktok.com api",
+          reason: null,
+        };
+      }
+      reasons.push("tiktok.com api returned no file");
+    } catch (err) {
+      reasons.push(`tiktok.com api: ${shortError(err)}`);
     }
   }
 
@@ -720,6 +843,15 @@ export async function describeProviders(): Promise<ProviderCheck[]> {
     ok: web.ok,
     latencyMs: web.latencyMs,
     detail: web.detail,
+  });
+
+  const apiCheck = await webApiCheck();
+  checks.push({
+    id: "tiktok-api",
+    label: "tiktok.com web api (hashtag list)",
+    ok: apiCheck.ok,
+    latencyMs: apiCheck.latencyMs,
+    detail: apiCheck.detail,
   });
 
   const searchStarted = Date.now();

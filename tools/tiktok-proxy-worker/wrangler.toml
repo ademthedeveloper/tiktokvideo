@@ -1,0 +1,7 @@
+# Deploy with: npx wrangler deploy
+name = "tiktok-desk-proxy"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# Optional: require the desk to send the same secret.
+# npx wrangler secret put PROXY_SECRET
