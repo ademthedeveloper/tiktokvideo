@@ -3,7 +3,8 @@
  *
  * Every read of TikTok goes through here and every read has a fallback:
  *
- *   search   tikwm /feed/search  →  #hashtag variants  →  tiktok.com tag page
+ *   search   tikwm /feed/search  →  tiktok.com hashtag API  →  tag page
+ *            (and, when the host's IP is blocked, the browser does it instead)
  *   links    tikwm /api/         →  tiktok.com embed  →  video page  →  oEmbed
  *   firehose tikwm /feed/list    →  tikwm search "fyp"
  *   enrich   tikwm /api/         →  tiktok.com embed  →  video page
@@ -14,7 +15,14 @@
 
 import type { FetchMode, TikTokVideo } from "./types";
 import { makeVideo } from "./video-factory";
-import { type Attempt, UpstreamError, shortError, withTimeout } from "./providers/net";
+import {
+  type Attempt,
+  UpstreamError,
+  lastUpstreamRelay,
+  resetUpstreamRelay,
+  shortError,
+  withTimeout,
+} from "./providers/net";
 import {
   fromTikwm,
   tikwmDetail,
@@ -133,6 +141,7 @@ export async function searchClips(opts: {
   const count = clampCount(opts.count, 12);
   const region = (opts.region ?? "US").toUpperCase();
   const attempts: Attempt[] = [];
+  resetUpstreamRelay();
   const tagsTried: { tag: string; found: number }[] = [];
   const byId = new Map<string, TikTokVideo>();
   let headline: string | null = null;
@@ -388,23 +397,27 @@ export async function searchClips(opts: {
     notice = "Type a keyword or #hashtag to search.";
   } else {
     const blocked = attempts.some((entry) =>
-      /bot-challenge|bot challenge|\b403\b|forbidden/i.test(entry.error ?? ""),
+      /bot-challenge|bot challenge|bot-filtered|\b403\b|forbidden|instead of json/i.test(
+        entry.error ?? "",
+      ),
     );
     const hint = blocked
-      ? "tikwm is blocking this server's IP — deploy tools/tiktok-proxy-worker and set TIKTOK_PROXY_URL, or point TIKTOK_FETCH_URL at a sidecar."
+      ? "this host's IP is blocked by TikTok and tikwm — the app now retries the same search from your browser; if it still comes back empty, deploy tools/tiktok-proxy-worker and set TIKTOK_PROXY_URL."
       : "try another spelling, paste links in Link grab, or run diagnostics in fetch health.";
     notice = `No clips for “${keyword}”. ${attempts
       .map((entry) => `${entry.provider}: ${entry.error ?? "0 hits"}`)
       .join(" · ")} — ${hint}`;
   }
 
+  const relay = lastUpstreamRelay();
+
   return {
     videos,
     tagsTried,
     attempts,
     headline,
-    upstream,
-    notice: trim(notice, 420),
+    upstream: relay ? `${upstream} · relay ${relay}` : upstream,
+    notice: trim(relay && videos.length ? `${notice} Borrowed the ${relay} relay to get past the block.` : notice, 420),
     degraded,
   };
 }
@@ -496,6 +509,7 @@ export async function resolveLinks(links: string[]): Promise<LinkOutcome> {
   const videos: TikTokVideo[] = [];
   const failures: { link: string; reason: string }[] = [];
   const attempts: Attempt[] = [];
+  resetUpstreamRelay();
   const providers = new Set<string>();
   let degraded = false;
 
@@ -896,6 +910,16 @@ export async function describeProviders(): Promise<ProviderCheck[]> {
       latencyMs: Date.now() - tagStarted,
       detail: shortError(err),
     });
+  }
+
+  /* Say out loud when a public relay did the borrowing. */
+  const relay = lastUpstreamRelay();
+  if (relay) {
+    for (const check of checks) {
+      if (check.ok && /tikwm/.test(check.id) && !/relay/.test(check.detail)) {
+        check.detail = `${check.detail} · via ${relay} relay`;
+      }
+    }
   }
 
   return checks;

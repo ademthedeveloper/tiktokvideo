@@ -11,6 +11,8 @@ import type {
 } from "@/lib/types";
 import { DEFAULT_SETTINGS, buildVariants, formatCount } from "@/lib/captions";
 import { makeVideo } from "@/lib/video-factory";
+import { extractTikTokLinks } from "@/lib/tiktok-client";
+import { browserEgress, browserEgressSupported } from "@/lib/browser-egress";
 import { HeaderBar, type Tab } from "./HeaderBar";
 import { SourcePanel, type FetchState } from "./SourcePanel";
 import { ClipCard } from "./ClipCard";
@@ -312,25 +314,84 @@ function StudioInner({
         };
         if (!res.ok || data.error) throw new Error(data.error ?? `Request failed (${res.status})`);
 
-        const incoming = data.videos ?? [];
+        let outcome = data;
+        let incoming = data.videos ?? [];
+
+        /*
+         * The host's IP is blocked by both tikwm and tiktok.com, so an empty
+         * answer from the server usually means "not this address" rather than
+         * "nothing exists". Retry the same search from the reader's own
+         * connection and let the server normalise what comes back.
+         */
+        if (!incoming.length && browserEgressSupported()) {
+          setState((prev) => ({
+            ...prev,
+            notice: "The server came back empty — asking tikwm from your browser instead…",
+          }));
+          const egress = await browserEgress({
+            mode: useMode,
+            keyword: useKeyword,
+            links: extractTikTokLinks(links),
+            region,
+            count,
+          });
+          if (egress.payloads.length) {
+            try {
+              const importRes = await fetch("/api/tiktok/import", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  mode: useMode,
+                  keyword: useKeyword,
+                  count,
+                  payloads: egress.payloads,
+                }),
+              });
+              const imported = (await importRes.json()) as typeof data;
+              if (importRes.ok && Array.isArray(imported.videos) && imported.videos.length) {
+                outcome = imported;
+                incoming = imported.videos;
+              }
+            } catch {
+              /* fall through to the block report below */
+            }
+          }
+          if (!incoming.length) {
+            const reasons = [
+              ...(data.attempts ?? []).map(
+                (attempt) => `${attempt.provider}: ${attempt.error ?? `${attempt.found} hits`}`,
+              ),
+              ...egress.attempts.map(
+                (attempt) => `${attempt.provider}: ${attempt.error ?? `${attempt.found} hits`}`,
+              ),
+            ];
+            outcome = {
+              ...data,
+              attempts: [...(data.attempts ?? []), ...egress.attempts],
+              notice: reasons.length
+                ? `No clips for “${useKeyword}”. ${reasons.join(" · ")} — the upstreams are refusing this connection too. Deploy tools/tiktok-proxy-worker and set TIKTOK_PROXY_URL to give the server an address they accept.`
+                : data.notice,
+            };
+          }
+        }
         setResults((prev) => {
           if (!append) return incoming;
           const seen = new Set(prev.map((video) => video.id));
           return [...prev, ...incoming.filter((video) => !seen.has(video.id))];
         });
-        setCursor(data.nextCursor ?? 0);
-        setHasMore(Boolean(data.hasMore) && useMode === "firehose");
+        setCursor(outcome.nextCursor ?? 0);
+        setHasMore(Boolean(outcome.hasMore) && useMode === "firehose");
         setState({
           loading: false,
           appending: false,
           error: null,
-          notice: data.notice ?? `${incoming.length} clips pulled`,
-          upstream: data.upstream ?? "tiktok.com",
-          degraded: Boolean(data.degraded),
+          notice: outcome.notice ?? `${incoming.length} clips pulled`,
+          upstream: outcome.upstream ?? "tiktok.com",
+          degraded: Boolean(outcome.degraded),
           count: incoming.length,
           at: clock(),
-          tagsTried: data.tagsTried ?? [],
-          attempts: data.attempts ?? [],
+          tagsTried: outcome.tagsTried ?? [],
+          attempts: outcome.attempts ?? [],
           resolving: 0,
         });
 
@@ -338,7 +399,7 @@ function StudioInner({
           toast(
             `${incoming.length} clip${incoming.length === 1 ? "" : "s"} found`,
             "ok",
-            data.notice ?? undefined,
+            outcome.notice ?? undefined,
           );
           void runEnrichment(incoming);
 
@@ -367,7 +428,7 @@ function StudioInner({
             }
           }
         } else {
-          toast("No clips matched", "warn", data.notice ?? "Try another tag, region, or Link grab");
+          toast("No clips matched", "warn", outcome.notice ?? "Try another tag, region, or Link grab");
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : "Fetch failed";
@@ -762,7 +823,7 @@ function IdleDesk({
           <p className="mt-4 max-w-xl text-[13.5px] leading-relaxed text-muted">
             Type what you want — <span className="text-text">relatable</span>,{" "}
             <span className="text-text">work memes</span>,{" "}
-            <span className="text-text">#gym</span> — and the desk reads TikTok's public tag pages
+            <span className="text-text">#gym</span> — and the desk reads TikTok&apos;s public tag pages
             to pull the clips actually ranked there, with their real captions, creators and stats.
             It then writes your repost caption with{" "}
             <span className="text-signal">cr: @creator</span> credit, and can publish the clip
@@ -819,7 +880,7 @@ function IdleDesk({
               <IconArrow className="h-3.5 w-3.5 text-signal" /> hook line you can reroll
             </li>
             <li className="flex items-center gap-2">
-              <IconArrow className="h-3.5 w-3.5 text-signal" /> creator's caption, cleaned
+              <IconArrow className="h-3.5 w-3.5 text-signal" /> creator&apos;s caption, cleaned
             </li>
             <li className="flex items-center gap-2">
               <IconArrow className="h-3.5 w-3.5 text-signal" /> your credit prefix + handle

@@ -141,9 +141,14 @@ async function apiGet(
     );
   }
   if (!text.trimStart().startsWith("{")) {
+    /*
+     * HTTP 200 + the HTML app shell means TikTok bot-filtered this IP: the API
+     * path falls through to the website's page instead of the JSON it serves
+     * browsers it trusts. Nothing about the request is wrong — the address is.
+     */
     throw new UpstreamError(
-      "TikTok's web API sent a page instead of JSON",
-      `HTTP ${res.status} on ${path}`,
+      "TikTok served its page instead of JSON",
+      `HTTP ${res.status} on ${path} — this IP is bot-filtered; it needs a proxy or a real browser`,
       PROVIDER,
       res.status,
     );

@@ -82,22 +82,22 @@ function viaProxy(url: string): { url: string; headers: Record<string, string> }
   return { url: `${proxy}${separator}url=${encodeURIComponent(url)}`, headers };
 }
 
-/** fetch() with a hard timeout and a normalised network error. */
-export async function request(
+/** One fetch with a hard timeout and a normalised network error. */
+async function attemptFetch(
   url: string,
-  init: RequestInit = {},
-  timeoutMs = 12_000,
-  provider = "upstream",
+  init: RequestInit,
+  timeoutMs: number,
+  provider: string,
+  extraHeaders?: Record<string, string>,
 ): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const proxied = viaProxy(url);
   const headers = new Headers(init.headers);
-  if (proxied) {
-    for (const [key, value] of Object.entries(proxied.headers)) headers.set(key, value);
+  if (extraHeaders) {
+    for (const [key, value] of Object.entries(extraHeaders)) headers.set(key, value);
   }
   try {
-    return await fetch(proxied?.url ?? url, {
+    return await fetch(url, {
       ...init,
       headers,
       signal: controller.signal,
@@ -114,6 +114,104 @@ export async function request(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/* ── public relays ─────────────────────────────────────────────────
+ * Free, key-less "fetch this URL for me" services. They exist because some
+ * hosts (Vercel, Lambda, Fly) get 403'd by Cloudflare on tikwm.com and served a
+ * soft-block shell by tiktok.com. A relay borrows a different IP for us.
+ *
+ * Used only when TIKTOK_PROXY_URL is unset, only for GETs to hosts we already
+ * scrape, and only when the direct answer looks like a block. Turn it off with
+ * TIKTOK_PUBLIC_RELAY=off. Every success is recorded so the UI can say which
+ * relay answered.
+ */
+const PUBLIC_RELAYS: { name: string; build: (url: string) => string }[] = [
+  {
+    name: "allorigins",
+    build: (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  },
+  {
+    name: "corsproxy.io",
+    build: (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+  },
+  {
+    name: "cors.lol",
+    build: (url) => `https://api.cors.lol/?url=${encodeURIComponent(url)}`,
+  },
+];
+
+/** Statuses that mean "the host is refusing this IP", not "the request was wrong". */
+const BLOCKED_STATUS = new Set([401, 403, 429, 500, 502, 503, 504]);
+
+let lastRelay: string | null = null;
+
+/** Name of the relay that answered the most recent successful request, if any. */
+export function lastUpstreamRelay(): string | null {
+  return lastRelay;
+}
+
+export function resetUpstreamRelay() {
+  lastRelay = null;
+}
+
+export function publicRelayEnabled(): boolean {
+  const flag = process.env.TIKTOK_PUBLIC_RELAY?.trim().toLowerCase();
+  return flag !== "off" && flag !== "0" && flag !== "false";
+}
+
+/**
+ * fetch() with a hard timeout, an optional egress proxy, and a last-resort
+ * public-relay retry. Callers only ever see a Response or an UpstreamError.
+ */
+export async function request(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = 12_000,
+  provider = "upstream",
+): Promise<Response> {
+  const proxied = viaProxy(url);
+  if (proxied) {
+    return attemptFetch(proxied.url, init, timeoutMs, provider, proxied.headers);
+  }
+
+  let direct: Response | null = null;
+  let directError: unknown = null;
+  try {
+    direct = await attemptFetch(url, init, timeoutMs, provider);
+  } catch (err) {
+    directError = err;
+  }
+
+  const method = String(init.method ?? "GET").toUpperCase();
+  const blocked = Boolean(directError) || (direct ? BLOCKED_STATUS.has(direct.status) : false);
+  if (blocked && method === "GET" && publicRelayEnabled() && isProxyTarget(url)) {
+    /* Keep the whole retry inside roughly one request window. */
+    const budget = Date.now() + Math.max(8_000, Math.min(18_000, timeoutMs * 1.5));
+    for (const relay of PUBLIC_RELAYS) {
+      const left = budget - Date.now();
+      if (left < 3_000) break;
+      let res: Response;
+      try {
+        res = await attemptFetch(
+          relay.build(url),
+          { method: "GET", headers: { Accept: "application/json, text/plain, */*" } },
+          Math.min(left, 9_000),
+          provider,
+        );
+      } catch {
+        continue;
+      }
+      if (res.ok) {
+        lastRelay = relay.name;
+        return res;
+      }
+      await res.text().catch(() => "");
+    }
+  }
+
+  if (directError) throw directError;
+  return direct as Response;
 }
 
 export function looksLikeHtml(body: string): boolean {
