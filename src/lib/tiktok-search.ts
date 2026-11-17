@@ -120,9 +120,12 @@ export type SearchPage = {
   tag: string;
   videos: TikTokVideo[];
   headline: string | null;
+  failure?: string;
 };
 
-async function readPage(url: string): Promise<string | null> {
+type ReadPageResult = { html: string; failure?: never } | { html: null; failure: string };
+
+async function readPage(url: string): Promise<ReadPageResult> {
   try {
     const res = await fetch(url, {
       headers: {
@@ -133,10 +136,15 @@ async function readPage(url: string): Promise<string | null> {
       cache: "no-store",
       redirect: "follow",
     });
-    if (!res.ok) return null;
-    return await res.text();
-  } catch {
-    return null;
+    if (!res.ok) {
+      return { html: null, failure: `TikTok returned HTTP ${res.status}` };
+    }
+    return { html: await res.text() };
+  } catch (error) {
+    return {
+      html: null,
+      failure: error instanceof Error ? error.message : "TikTok could not be reached",
+    };
   }
 }
 
@@ -199,8 +207,11 @@ export async function searchTagPage(tag: string): Promise<SearchPage> {
   const url = tag.startsWith("@")
     ? `https://www.tiktok.com/${tag}`
     : `https://www.tiktok.com/tag/${encodeURIComponent(tag)}`;
-  const html = await readPage(url);
-  if (!html) return { tag, videos: [], headline: null };
+  const page = await readPage(url);
+  if (!page.html) {
+    return { tag, videos: [], headline: null, failure: page.failure };
+  }
+  const html = page.html;
   const items = parseItemList(html);
   const videos = items
     .map((item, index) => toItem(item, tag, index))
@@ -233,11 +244,13 @@ export async function searchTikTok(opts: {
   const byId = new Map<string, TikTokVideo>();
   const tried: { tag: string; found: number }[] = [];
   let headline: string | null = null;
+  let upstreamFailure: string | undefined;
 
   for (const tag of candidates) {
     if (byId.size >= count) break;
     const page = await searchTagPage(tag);
     tried.push({ tag, found: page.videos.length });
+    if (!upstreamFailure && page.failure) upstreamFailure = page.failure;
     if (!headline && page.headline) headline = page.headline;
     for (const video of page.videos) {
       if (!byId.has(video.id)) byId.set(video.id, video);
@@ -258,9 +271,11 @@ export async function searchTikTok(opts: {
   const totalFound = tried.reduce((sum, entry) => sum + entry.found, 0);
   let notice: string | undefined;
   if (!videos.length) {
-    notice = totalFound
-      ? "TikTok returned clips but none matched — try a broader tag."
-      : `TikTok had no public #${candidates[0]} list right now. Try another spelling or use Link Grab.`;
+    notice = upstreamFailure
+      ? `TikTok search is temporarily unavailable (${upstreamFailure}). Try Link Grab with a TikTok video URL, or try again later.`
+      : totalFound
+        ? "TikTok returned clips but none matched — try a broader tag."
+        : `TikTok had no public #${candidates[0]} list right now. Try another spelling or use Link Grab.`;
   } else if (videos.length < count) {
     notice = `Found ${videos.length} clips across ${tried
       .filter((entry) => entry.found > 0)
