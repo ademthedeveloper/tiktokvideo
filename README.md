@@ -42,8 +42,8 @@ attempt is reported back to the UI:
 
 | Read      | 1st choice                        | then                                        | then                    |
 | --------- | --------------------------------- | ------------------------------------------- | ----------------------- |
-| Search    | optional self-hosted sidecar      | tikwm `/api/feed/search` (keyword + hashtag) | `tiktok.com/tag/<tag>` |
-| Link grab | optional sidecar                  | tikwm `/api/`                                | tiktok.com embed → video page → oEmbed |
+| Search    | optional self-hosted sidecar      | tikwm `/api/feed/search` (keyword + hashtag) | tiktok.com web API (`/api/challenge/item_list/`) → `tiktok.com/tag/<tag>` |
+| Link grab | optional sidecar                  | tikwm `/api/`                                | tiktok.com web API → embed → video page → oEmbed |
 | Firehose  | tikwm `/api/feed/list`            | tikwm search `fyp`                           | —                       |
 | Enrich    | optional sidecar                  | tikwm `/api/`                                | tiktok.com embed → video page |
 
@@ -72,7 +72,32 @@ blocked this IP" from "this provider changed its response".
 | --- | --- |
 | `TIKWM_BASE_URL` | use a tikwm mirror instead of `https://www.tikwm.com` |
 | `TIKTOK_COOKIE` | a logged-out browser cookie header; makes direct tiktok.com reads far more reliable |
+| `TIKTOK_PROXY_URL` / `TIKTOK_PROXY_SECRET` | route tikwm/tiktok.com through your own proxy (`tools/tiktok-proxy-worker`) |
 | `TIKTOK_FETCH_URL` / `TIKTOK_FETCH_TOKEN` | your own fetch service, used before public scrapers (see §4) |
+
+### If tikwm blocks your host (`403 bot challenge`)
+
+Vercel/Lambda/Fly/Render egress from datacenter IPs, and Cloudflare answers those
+with a bot challenge — that is the `tikwm is serving a bot-challenge page — HTTP
+403` error. Two ways around it; the first needs no server:
+
+1. **Cloudflare Worker proxy (free, ~2 minutes).** Deploy
+   [`tools/tiktok-proxy-worker`](tools/tiktok-proxy-worker), then set:
+
+   ```bash
+   TIKTOK_PROXY_URL=https://<your-worker>.workers.dev/
+   TIKTOK_PROXY_SECRET=some-long-random-string   # optional but recommended
+   ```
+
+   Only tikwm/tiktok.com requests are routed through it; everything else is
+   untouched.
+
+2. **Self-hosted sidecar** (§4) — searches then skip tikwm entirely.
+
+`tiktok.com` itself is usually reachable from datacenter IPs, so the desk also
+queries TikTok's own hashtag/item-list API (`/api/challenge/...`) as a provider.
+That path needs no proxy, but TikTok sometimes demands a request signature,
+which is why the proxy is the dependable fallback.
 
 ### If your network blocks everything
 
