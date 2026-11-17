@@ -19,6 +19,7 @@ import {
   UpstreamError,
   absolutise,
   deepFind,
+  fetchViaRelays,
   readScriptJson,
   request,
   toIsoDate,
@@ -317,7 +318,28 @@ export async function videoPage(
     );
   }
   const html = await res.text();
+  const direct = parseVideoHtml(html, id, username, path);
+  if (direct) return direct;
 
+  /* Same soft block as the tag pages: a 200 shell with no clip data. */
+  const relayed = await fetchViaRelays(`${ORIGIN}/${path}`, 9_000, PROVIDER, {
+    jsonOnly: false,
+  }).catch(() => null);
+  if (relayed) {
+    const retry = parseVideoHtml(relayed.text, id, username, path);
+    if (retry) return retry;
+  }
+
+  return null;
+}
+
+/** Pure parser for a video page body — shared by the direct and relayed reads. */
+function parseVideoHtml(
+  html: string,
+  id: string,
+  username: string | null | undefined,
+  path: string,
+): TikTokVideo | null {
   const universal = readScriptJson(html, "__UNIVERSAL_DATA_FOR_REHYDRATION__");
   const scope = universal?.__DEFAULT_SCOPE__;
   const item =
@@ -414,12 +436,8 @@ export type TagPageResult = {
 
 export async function tagPage(tag: string, cookie?: string | null): Promise<TagPageResult> {
   const clean = tag.replace(/^#/, "").trim();
-  const res = await request(
-    `${ORIGIN}/tag/${encodeURIComponent(clean)}`,
-    { headers: headers(cookie, "browser") },
-    14_000,
-    PROVIDER,
-  );
+  const url = `${ORIGIN}/tag/${encodeURIComponent(clean)}`;
+  const res = await request(url, { headers: headers(cookie, "browser") }, 14_000, PROVIDER);
   if (!res.ok) {
     throw new UpstreamError(
       "tiktok.com would not serve that hashtag page",
@@ -429,6 +447,28 @@ export async function tagPage(tag: string, cookie?: string | null): Promise<TagP
     );
   }
   const html = await res.text();
+  const direct = parseTagHtml(html, clean);
+
+  /*
+   * A 200 with no clips is TikTok's soft block: it served the website shell to
+   * this IP. Ask a relay for the same page from a different address and keep
+   * whichever answer actually carries clips.
+   */
+  if (!direct.videos.length) {
+    const relayed = await fetchViaRelays(url, 9_000, PROVIDER, { jsonOnly: false }).catch(
+      () => null,
+    );
+    if (relayed) {
+      const retry = parseTagHtml(relayed.text, clean);
+      if (retry.videos.length) return retry;
+    }
+  }
+
+  return direct;
+}
+
+/** Pure parser for a hashtag page body — shared by the direct and relayed reads. */
+function parseTagHtml(html: string, clean: string): TagPageResult {
   const universal = readScriptJson(html, "__UNIVERSAL_DATA_FOR_REHYDRATION__");
   const scope = universal?.__DEFAULT_SCOPE__;
   const challengeInfo = scope?.["webapp.tag-detail"]?.challengeInfo;

@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { extractJsonPayload } from "@/lib/providers/net";
 import { fromTikwm } from "@/lib/providers/tikwm";
 import type { FetchMode, ProviderAttempt, TikTokVideo } from "@/lib/types";
 
@@ -50,6 +51,29 @@ export async function POST(request: Request) {
   const count = Math.min(30, Math.max(1, Number(body?.count ?? 12) || 12));
   const payloads: any[] = Array.isArray(body?.payloads) ? body.payloads.slice(0, 8) : [];
 
+  /*
+   * Manual escape hatch: when every route from this host and this browser is
+   * refused, the reader can open the upstream URL in a tab and paste the JSON
+   * here. Same normaliser, no network involved.
+   */
+  const pasted = typeof body?.text === "string" ? body.text.trim() : "";
+  if (pasted) {
+    const json = extractJsonPayload(pasted);
+    if (!json) {
+      return NextResponse.json(
+        { error: "That does not look like the JSON tikwm shows in a tab — copy the whole thing, braces included." },
+        { status: 400 },
+      );
+    }
+    let parsed: any;
+    try {
+      parsed = JSON.parse(json);
+    } catch {
+      return NextResponse.json({ error: "That JSON did not parse — copy it again." }, { status: 400 });
+    }
+    payloads.push({ provider: "pasted from a tikwm tab", ms: 0, body: parsed });
+  }
+
   if (!payloads.length) {
     return NextResponse.json(
       { error: "Nothing to import — the browser did not get an answer either.", videos: [] },
@@ -91,18 +115,24 @@ export async function POST(request: Request) {
     firehose: "read",
   };
 
+  const source = pasted ? "pasted tikwm JSON" : "your browser → tikwm";
+
   return NextResponse.json({
     videos: ordered,
     nextCursor: 0,
     hasMore: false,
     mode,
-    upstream: "your browser → tikwm",
+    upstream: source,
     attempts,
     degraded: false,
     notice: ordered.length
-      ? `${ordered.length} clip${ordered.length === 1 ? "" : "s"} ${
-          verbs[mode] ?? verbs.search
-        } from your browser — tikwm answered your connection, not the server's.`
-      : `The browser reached tikwm but it had no clips for “${keyword}”. Try a broader keyword.`,
+      ? pasted
+        ? `${ordered.length} clip${ordered.length === 1 ? "" : "s"} read from the JSON you pasted.`
+        : `${ordered.length} clip${ordered.length === 1 ? "" : "s"} ${
+            verbs[mode] ?? verbs.search
+          } from your browser — tikwm answered your connection, not the server's.`
+      : pasted
+        ? `That JSON had no clips this desk understands for “${keyword}”. Try the search endpoint’s JSON.`
+        : `The browser reached tikwm but it had no clips for “${keyword}”. Try a broader keyword.`,
   });
 }

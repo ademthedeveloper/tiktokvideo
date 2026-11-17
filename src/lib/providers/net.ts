@@ -126,10 +126,26 @@ async function attemptFetch(
  * TIKTOK_PUBLIC_RELAY=off. Every success is recorded so the UI can say which
  * relay answered.
  */
-const PUBLIC_RELAYS: { name: string; build: (url: string) => string }[] = [
+type Relay = {
+  name: string;
+  /** Build the relay URL for a target. */
+  build: (url: string) => string;
+  headers?: Record<string, string>;
+};
+
+const PUBLIC_RELAYS: Relay[] = [
   {
     name: "allorigins",
     build: (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  },
+  {
+    name: "codetabs",
+    build: (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+  },
+  {
+    name: "jina",
+    build: (url) => `https://r.jina.ai/${url}`,
+    headers: { "x-return-format": "text" },
   },
   {
     name: "corsproxy.io",
@@ -155,14 +171,102 @@ export function resetUpstreamRelay() {
   lastRelay = null;
 }
 
+export function relayNames(): string[] {
+  return PUBLIC_RELAYS.map((relay) => relay.name);
+}
+
 export function publicRelayEnabled(): boolean {
   const flag = process.env.TIKTOK_PUBLIC_RELAY?.trim().toLowerCase();
   return flag !== "off" && flag !== "0" && flag !== "false";
 }
 
 /**
+ * Pull the first JSON object/array out of a body that may be wrapped in prose,
+ * markdown fences, or an HTML preview (relays do this to JSON responses).
+ */
+export function extractJsonPayload(text: string): string | null {
+  const body = text.replace(/^\uFEFF/, "").trim();
+  if (!body) return null;
+  const startsJson = body.startsWith("{") || body.startsWith("[");
+  if (startsJson) {
+    try {
+      JSON.parse(body);
+      return body;
+    } catch {
+      /* fall through: there may be trailing junk */
+    }
+  }
+  for (const [open, close] of [
+    ["{", "}"],
+    ["[", "]"],
+  ] as const) {
+    const from = body.indexOf(open);
+    const to = body.lastIndexOf(close);
+    if (from === -1 || to <= from) continue;
+    const slice = body.slice(from, to + 1);
+    try {
+      JSON.parse(slice);
+      return slice;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+/**
+ * Ask every free relay at once and take the first that returns real JSON.
+ *
+ * They all borrow a different IP, and each is flaky in its own way (allorigins
+ * is slow, corsproxy.io wants an allowed Origin, jina rate-limits), so racing
+ * them is both faster than trying in turn and far more likely to find one that
+ * is not blocked by the host that just blocked us.
+ */
+export async function fetchViaRelays(
+  url: string,
+  timeoutMs = 9_000,
+  provider = "upstream",
+  options: { jsonOnly?: boolean } = {},
+): Promise<{ relay: string; text: string } | null> {
+  const jsonOnly = options.jsonOnly !== false;
+  if (!publicRelayEnabled() || !isProxyTarget(url)) return null;
+
+  const attempts = PUBLIC_RELAYS.map(async (relay) => {
+    const res = await attemptFetch(
+      relay.build(url),
+      {
+        method: "GET",
+        headers: {
+          Accept: "application/json, text/plain, */*",
+          ...(relay.headers ?? {}),
+        },
+      },
+      timeoutMs,
+      provider,
+    );
+    const text = await res.text();
+    if (!res.ok) throw new Error(`${relay.name} answered HTTP ${res.status}`);
+    if (!jsonOnly) {
+      if (!text.trim()) throw new Error(`${relay.name} returned nothing`);
+      return { relay: relay.name, text };
+    }
+    const payload = extractJsonPayload(text);
+    if (!payload) throw new Error(`${relay.name} did not return JSON`);
+    return { relay: relay.name, text: payload };
+  });
+
+  try {
+    const winner = await Promise.any(attempts);
+    lastRelay = winner.relay;
+    return winner;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * fetch() with a hard timeout, an optional egress proxy, and a last-resort
- * public-relay retry. Callers only ever see a Response or an UpstreamError.
+ * public-relay race. Callers only ever see a Response or an UpstreamError.
  */
 export async function request(
   url: string,
@@ -185,28 +289,13 @@ export async function request(
 
   const method = String(init.method ?? "GET").toUpperCase();
   const blocked = Boolean(directError) || (direct ? BLOCKED_STATUS.has(direct.status) : false);
-  if (blocked && method === "GET" && publicRelayEnabled() && isProxyTarget(url)) {
-    /* Keep the whole retry inside roughly one request window. */
-    const budget = Date.now() + Math.max(8_000, Math.min(18_000, timeoutMs * 1.5));
-    for (const relay of PUBLIC_RELAYS) {
-      const left = budget - Date.now();
-      if (left < 3_000) break;
-      let res: Response;
-      try {
-        res = await attemptFetch(
-          relay.build(url),
-          { method: "GET", headers: { Accept: "application/json, text/plain, */*" } },
-          Math.min(left, 9_000),
-          provider,
-        );
-      } catch {
-        continue;
-      }
-      if (res.ok) {
-        lastRelay = relay.name;
-        return res;
-      }
-      await res.text().catch(() => "");
+  if (blocked && method === "GET") {
+    const relayed = await fetchViaRelays(url, Math.min(timeoutMs, 9_000), provider);
+    if (relayed) {
+      return new Response(relayed.text, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
     }
   }
 
