@@ -90,6 +90,19 @@ export function ensureSchema(): Promise<void> {
         )
       `);
       await db.execute(sql`
+        CREATE TABLE IF NOT EXISTS tiktok_sessions (
+          id integer PRIMARY KEY DEFAULT 1,
+          session_id text NOT NULL DEFAULT '',
+          cookie_header text NOT NULL DEFAULT '',
+          username text,
+          display_name text,
+          avatar_url text,
+          verified boolean NOT NULL DEFAULT false,
+          note text NOT NULL DEFAULT '',
+          updated_at timestamptz NOT NULL DEFAULT now()
+        )
+      `);
+      await db.execute(sql`
         CREATE TABLE IF NOT EXISTS publish_jobs (
           id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
           post_id uuid,
@@ -109,6 +122,10 @@ export function ensureSchema(): Promise<void> {
           updated_at timestamptz NOT NULL DEFAULT now()
         )
       `);
+      // Additive migrations for databases created by earlier versions.
+      await db.execute(
+        sql`ALTER TABLE publish_jobs ADD COLUMN IF NOT EXISTS provider text NOT NULL DEFAULT ''`,
+      );
       await db.execute(
         sql`INSERT INTO app_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING`,
       );

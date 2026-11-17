@@ -94,6 +94,24 @@ export const tiktokAccounts = pgTable("tiktok_accounts", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+/**
+ * Cookie-based TikTok session — the no-developer-account posting path.
+ * A sessionid is the same credential your browser holds after logging in.
+ */
+export const tiktokSessions = pgTable("tiktok_sessions", {
+  id: integer("id").primaryKey().default(1),
+  sessionId: text("session_id").notNull().default(""),
+  cookieHeader: text("cookie_header").notNull().default(""),
+  username: text("username"),
+  displayName: text("display_name"),
+  avatarUrl: text("avatar_url"),
+  verified: boolean("verified").notNull().default(false),
+  note: text("note").notNull().default(""),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
 /** Every publish attempt made from the desk. */
 export const publishJobs = pgTable("publish_jobs", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -107,6 +125,8 @@ export const publishJobs = pgTable("publish_jobs", {
   videoSize: integer("video_size"),
   uploadedBytes: integer("uploaded_bytes"),
   publishId: text("publish_id"),
+  /** "api" (Content Posting API) or "session" (cookie uploader). */
+  provider: text("provider").notNull().default(""),
   status: text("status").notNull().default("PENDING"),
   failReason: text("fail_reason"),
   publicPostIds: text("public_post_ids").notNull().default(""),

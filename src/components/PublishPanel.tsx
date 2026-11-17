@@ -3,9 +3,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   PrivacyLevel,
+  PublishBackend,
   PublishJob,
   PublishMode,
   SavedPost,
+  SessionStatus,
   Settings,
   TikTokAccount,
   TikTokVideo,
@@ -24,6 +26,13 @@ import {
   IconUpload,
   IconUser,
 } from "./icons";
+
+const SESSION_STEPS = [
+  "Install the uploader once: pip install tiktok-uploader && playwright install chromium",
+  "Log in to tiktok.com in your own browser and open DevTools → Application → Cookies → .tiktok.com",
+  "Copy the sessionid value and paste it above (or set TIKTOK_SESSION_ID in the environment)",
+  "Point TIKTOK_UPLOADER_CMD at your own tool if you use a different one — {file}, {caption} and {cookies} are substituted",
+];
 
 const PRIVACY: { id: PrivacyLevel; label: string; blurb: string }[] = [
   { id: "PUBLIC_TO_EVERYONE", label: "Public", blurb: "Everyone. Needs an audited app." },
@@ -81,6 +90,11 @@ export function PublishPanel({
   const [coverMs, setCoverMs] = useState(1000);
   const [manualToken, setManualToken] = useState("");
   const [showTokenForm, setShowTokenForm] = useState(false);
+  const [session, setSession] = useState<SessionStatus | null>(null);
+  const [sessionInput, setSessionInput] = useState("");
+  const [savingSession, setSavingSession] = useState(false);
+  const [showSessionHelp, setShowSessionHelp] = useState(false);
+  const [backend, setBackend] = useState<PublishBackend>("auto");
   const [publishing, setPublishing] = useState(false);
   const [result, setResult] = useState<{ ok: boolean; text: string; detail?: string } | null>(
     null,
@@ -111,6 +125,16 @@ export function PublishPanel({
     }
   }, []);
 
+  const loadSession = useCallback(async () => {
+    try {
+      const res = await fetch("/api/tiktok/session", { cache: "no-store" });
+      const data = await res.json();
+      if (data.session) setSession(data.session);
+    } catch {
+      /* the session path is optional */
+    }
+  }, []);
+
   const loadJobs = useCallback(async () => {
     try {
       const res = await fetch("/api/tiktok/publish", { cache: "no-store" });
@@ -124,7 +148,45 @@ export function PublishPanel({
   useEffect(() => {
     void loadAccount();
     void loadJobs();
-  }, [loadAccount, loadJobs]);
+    void loadSession();
+  }, [loadAccount, loadJobs, loadSession]);
+
+  const saveSessionId = async () => {
+    if (!sessionInput.trim()) return;
+    setSavingSession(true);
+    try {
+      const res = await fetch("/api/tiktok/session", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: sessionInput.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "session rejected");
+      setSessionInput("");
+      setSession(data.session ?? null);
+      toast(
+        data.session?.verified ? "TikTok session linked" : "Session saved",
+        "ok",
+        data.message ?? undefined,
+      );
+      await loadSession();
+    } catch (err) {
+      toast("Could not store the session", "warn", err instanceof Error ? err.message : undefined);
+    } finally {
+      setSavingSession(false);
+    }
+  };
+
+  const forgetSession = async () => {
+    try {
+      await fetch("/api/tiktok/session", { method: "DELETE" });
+      setSession(null);
+      await loadSession();
+      toast("TikTok session removed", "info");
+    } catch {
+      toast("Could not clear the session", "warn");
+    }
+  };
 
   /* keep unfinished jobs ticking */
   useEffect(() => {
@@ -296,6 +358,7 @@ export function PublishPanel({
         form.set("disableDuet", String(disableDuet));
         form.set("disableStitch", String(disableStitch));
         form.set("coverTimestampMs", String(coverMs));
+        form.set("backend", backend);
         res = await fetch("/api/tiktok/publish", { method: "POST", body: form });
       } else {
         res = await fetch("/api/tiktok/publish", {
@@ -311,6 +374,7 @@ export function PublishPanel({
             disableDuet,
             disableStitch,
             coverTimestampMs: coverMs,
+            backend,
           }),
         });
       }
@@ -343,7 +407,12 @@ export function PublishPanel({
     }
   };
 
-  const connected = Boolean(account?.connected);
+  const apiConnected = Boolean(account?.connected);
+  const sessionConnected = Boolean(session?.connected);
+  const connected = apiConnected || sessionConnected;
+  const uploaderOff = session?.uploader.mode === "off";
+  const effectiveBackend: "session" | "api" =
+    backend === "auto" ? (sessionConnected ? "session" : "api") : backend;
 
   return (
     <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
@@ -356,8 +425,9 @@ export function PublishPanel({
             Post it to TikTok
           </h2>
           <p className="mt-1.5 max-w-2xl text-[12.5px] leading-relaxed text-muted">
-            Send a queued clip, a search result, or a file from your disk straight to your TikTok
-            through the official Content Posting API — caption, credit line, privacy level and all.
+            Send a queued clip, a search result, or a file from your disk straight to your TikTok —
+            through your logged-in session (no developer account) or the official Content Posting
+            API, with caption, credit line, privacy level and all.
           </p>
         </Reveal>
 
@@ -390,25 +460,38 @@ export function PublishPanel({
             </span>
             <div className="min-w-0 flex-1">
               <p className="font-display text-[13px] font-bold tracking-[0.1em] text-text uppercase">
-                {loadingAccount
+                {loadingAccount && !session
                   ? "Checking account…"
-                  : connected
+                  : apiConnected
                     ? (account?.displayName ?? account?.username ?? "TikTok account connected")
-                    : "No TikTok account connected"}
+                    : sessionConnected
+                      ? `@${session?.username ?? "your account"} · session`
+                      : "No TikTok account connected"}
               </p>
               <p className="mono-num mt-0.5 text-[10.5px] tracking-[0.1em] text-dim uppercase">
-                {connected
-                  ? `${account?.source === "env" ? "env token" : "oauth"} · scopes ${
+                {apiConnected
+                  ? `api · ${account?.source === "env" ? "env token" : "oauth"} · scopes ${
                       account?.scopes?.length ? account.scopes.join(", ") : "assumed"
                     }${account?.expiresAt ? ` · expires ${formatAgo(account.expiresAt)}` : ""}`
-                  : (account?.note ?? "Connect to post from this desk")}
+                  : sessionConnected
+                    ? `session cookie · ${session?.verified ? "verified" : "unverified"} · ${
+                        session?.uploader.mode === "off" ? "uploads disabled" : session?.uploader.mode
+                      }`
+                    : (account?.note ?? "Link a session cookie below — no developer account needed")}
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-1.5">
-              <Button size="sm" onClick={loadAccount} title="Re-check connection">
+              <Button
+                size="sm"
+                onClick={() => {
+                  void loadAccount();
+                  void loadSession();
+                }}
+                title="Re-check connection"
+              >
                 <IconRefresh className={`h-3.5 w-3.5 ${loadingAccount ? "animate-spin" : ""}`} />
               </Button>
-              {connected ? (
+              {apiConnected ? (
                 <Button size="sm" variant="danger" onClick={disconnect}>
                   Disconnect
                 </Button>
@@ -421,7 +504,7 @@ export function PublishPanel({
             </div>
           </div>
 
-          {connected && account?.privacyLevels?.length ? (
+          {apiConnected && account?.privacyLevels?.length ? (
             <div className="mono-num mt-3 flex flex-wrap gap-1.5 border-t border-line pt-3 text-[10px] tracking-[0.12em] text-dim uppercase">
               <span>allowed privacy levels:</span>
               {account.privacyLevels.map((level) => (
@@ -432,53 +515,141 @@ export function PublishPanel({
             </div>
           ) : null}
 
-          {!connected ? (
-            <div className="mt-3 border border-line bg-pit/60 p-3">
+          {/* session (no developer account) card */}
+          <div className="mt-3 border border-line bg-pit/60 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <p className="mono-num text-[10px] tracking-[0.2em] text-signal uppercase">
-                two ways to connect
+                no developer account? link your session
               </p>
-              <ol className="mt-2 space-y-1.5 text-[11.5px] leading-snug text-muted">
-                <li>
-                  <b className="text-text">1 · OAuth (recommended).</b> Set{" "}
-                  <code className="mono-num text-signal">TIKTOK_CLIENT_KEY</code> and{" "}
-                  <code className="mono-num text-signal">TIKTOK_CLIENT_SECRET</code> from your
-                  TikTok developer app with the Content Posting API product enabled and the scopes{" "}
-                  <code className="mono-num">video.publish</code>,{" "}
-                  <code className="mono-num">video.upload</code>,{" "}
-                  <code className="mono-num">user.info.basic</code>. Then hit Connect TikTok.
-                </li>
-                <li>
-                  <b className="text-text">2 · Paste a token.</b> Generate a user access token in the
-                  TikTok API console and store it here — or set{" "}
-                  <code className="mono-num text-signal">TIKTOK_ACCESS_TOKEN</code>.
-                </li>
-              </ol>
-              <div className="mt-2.5 flex flex-wrap gap-1.5">
-                <Button size="sm" onClick={() => setShowTokenForm((value) => !value)}>
-                  {showTokenForm ? "Hide token field" : "Paste access token"}
-                </Button>
-                <span className="mono-num self-center text-[10px] text-dim uppercase">
-                  {account?.clientKeyConfigured
-                    ? "client key detected"
-                    : "no client key in env"}
-                </span>
+              <span
+                className={`mono-num border px-1.5 py-0.5 text-[9.5px] tracking-[0.12em] uppercase ${
+                  sessionConnected
+                    ? "border-acid/50 bg-acid/10 text-acid"
+                    : "border-line2 text-dim"
+                }`}
+              >
+                {sessionConnected
+                  ? session?.verified
+                    ? "session verified"
+                    : "session saved"
+                  : "no session"}
+              </span>
+            </div>
+            <p className="mt-2 text-[11.5px] leading-snug text-muted">
+              TikTok&apos;s official API needs a developer app plus an app review. Instead the desk
+              can drive the MIT-licensed{" "}
+              <a
+                className="text-signal underline decoration-dotted"
+                href="https://github.com/wkaisertexas/tiktok-uploader"
+                target="_blank"
+                rel="noreferrer"
+              >
+                tiktok-uploader
+              </a>{" "}
+              with the <code className="mono-num text-signal">sessionid</code> cookie from your own
+              logged-in browser. No app, no client key, no redirect URI.
+            </p>
+
+            {sessionConnected ? (
+              <div className="mt-2.5 space-y-1.5">
+                <p className="mono-num text-[10.5px] text-dim">
+                  session {session?.maskedSessionId ?? "from cookie file"}
+                  {session?.username ? ` · @${session.username}` : ""}
+                  {session?.source === "env" ? " · from env" : ""}
+                </p>
+                <p className="text-[11px] leading-snug text-muted">
+                  {session?.uploader.detail}
+                  {uploaderOff ? " Uploads are switched off right now." : ""}
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  <Button size="sm" onClick={() => setShowSessionHelp((value) => !value)}>
+                    {showSessionHelp ? "Hide setup" : "Setup / replace"}
+                  </Button>
+                  {session?.source === "db" ? (
+                    <Button size="sm" variant="danger" onClick={forgetSession}>
+                      Forget session
+                    </Button>
+                  ) : null}
+                </div>
               </div>
-              {showTokenForm ? (
-                <div className="mt-2.5 flex gap-1.5">
+            ) : null}
+
+            {!sessionConnected || showSessionHelp ? (
+              <div className="mt-2.5 space-y-2">
+                <div className="flex flex-wrap gap-1.5">
                   <input
-                    className={`${inputClass} mono-num text-[11.5px]`}
-                    value={manualToken}
-                    placeholder="act.xxxxxxxxxxxxxxxx"
+                    className={`${inputClass} mono-num min-w-0 flex-1 text-[11.5px]`}
+                    value={sessionInput}
+                    placeholder="paste sessionid…"
                     spellCheck={false}
-                    onChange={(event) => setManualToken(event.target.value)}
+                    autoComplete="off"
+                    onChange={(event) => setSessionInput(event.target.value)}
                   />
-                  <Button size="sm" variant="primary" onClick={pasteToken} disabled={!manualToken.trim()}>
-                    Store
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    onClick={saveSessionId}
+                    disabled={!sessionInput.trim() || savingSession}
+                  >
+                    {savingSession ? <Spinner className="h-3.5 w-3.5" /> : null}
+                    Save session
                   </Button>
                 </div>
-              ) : null}
-            </div>
-          ) : null}
+                <details className="text-[11px] text-muted">
+                  <summary className="mono-num cursor-pointer text-[10px] tracking-[0.14em] text-dim uppercase">
+                    how to get the cookie
+                  </summary>
+                  <ol className="mt-1.5 list-decimal space-y-1 pl-4 leading-snug">
+                    {(session?.instructions ?? SESSION_STEPS).map((step) => (
+                      <li key={step}>{step}</li>
+                    ))}
+                  </ol>
+                </details>
+                {!apiConnected ? (
+                  <div className="border-t border-line pt-2">
+                    <p className="text-[11px] leading-snug text-dim">
+                      Prefer the official route?{" "}
+                      <button
+                        type="button"
+                        className="text-signal underline underline-offset-2"
+                        onClick={connect}
+                      >
+                        Connect with OAuth
+                      </button>{" "}
+                      once you have a developer app, or{" "}
+                      <button
+                        type="button"
+                        className="text-signal underline underline-offset-2"
+                        onClick={() => setShowTokenForm((value) => !value)}
+                      >
+                        paste an access token
+                      </button>
+                      .
+                    </p>
+                    {showTokenForm ? (
+                      <div className="mt-2 flex gap-1.5">
+                        <input
+                          className={`${inputClass} mono-num text-[11.5px]`}
+                          value={manualToken}
+                          placeholder="act.xxxxxxxxxxxxxxxx"
+                          spellCheck={false}
+                          onChange={(event) => setManualToken(event.target.value)}
+                        />
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          onClick={pasteToken}
+                          disabled={!manualToken.trim()}
+                        >
+                          Store
+                        </Button>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
         </section>
 
         {/* composer */}
@@ -539,7 +710,9 @@ export function PublishPanel({
                   <p className="mt-1.5 text-[11px] leading-snug text-dim">
                     {mode === "DIRECT_POST"
                       ? "Publishes straight to your profile with the caption above."
-                      : "Drops the video in your TikTok inbox so you finish it in the app."}
+                      : effectiveBackend === "session"
+                        ? "Drafts need the official API — a session upload posts straight to your profile."
+                        : "Drops the video in your TikTok inbox so you finish it in the app."}
                   </p>
                 </Field>
                 <Field label="Privacy">
@@ -564,6 +737,28 @@ export function PublishPanel({
                   </div>
                 </Field>
               </div>
+
+              {apiConnected && sessionConnected ? (
+                <Field label="Post via" hint="session needs no developer app">
+                  <div className="flex flex-wrap gap-1.5">
+                    {(
+                      [
+                        ["auto", "auto"],
+                        ["session", "session"],
+                        ["api", "api"],
+                      ] as [PublishBackend, string][]
+                    ).map(([value, label]) => (
+                      <Chip
+                        key={value}
+                        active={backend === value}
+                        onClick={() => setBackend(value)}
+                      >
+                        {label}
+                      </Chip>
+                    ))}
+                  </div>
+                </Field>
+              ) : null}
 
               <Field label="Cover frame" hint={`${(coverMs / 1000).toFixed(1)}s into the clip`}>
                 <input

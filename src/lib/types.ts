@@ -39,6 +39,14 @@ export type TikTokVideo = {
 
 export type SearchAttempt = { tag: string; found: number };
 
+export type ProviderAttempt = {
+  provider: string;
+  query: string;
+  found: number;
+  error?: string;
+  ms: number;
+};
+
 export type FetchResult = {
   videos: TikTokVideo[];
   nextCursor: number;
@@ -48,8 +56,47 @@ export type FetchResult = {
   notice?: string;
   degraded?: boolean;
   tagsTried?: SearchAttempt[];
+  attempts?: ProviderAttempt[];
+  failures?: { link: string; reason: string }[];
   headline?: string | null;
 };
+
+/** One row of the Source panel's provider health sweep. */
+export type DiagnosticsCheck = {
+  id: string;
+  label: string;
+  ok: boolean;
+  latencyMs: number;
+  detail: string;
+};
+
+export type UploaderMode = "cli" | "http" | "off";
+
+/** Cookie-session posting status (no developer account needed). */
+export type SessionStatus = {
+  connected: boolean;
+  source: "db" | "env" | "none";
+  maskedSessionId: string | null;
+  username: string | null;
+  displayName: string | null;
+  avatarUrl: string | null;
+  verified: boolean;
+  detail: string | null;
+  updatedAt: string | null;
+  uploader: {
+    mode: UploaderMode;
+    requested: string;
+    command: string;
+    url: string;
+    cookiesFileConfigured: boolean;
+    ready: boolean | null;
+    detail: string;
+  };
+  instructions: string[];
+};
+
+/** Which backend a publish attempt should use. */
+export type PublishBackend = "auto" | "session" | "api";
 
 export type PrivacyLevel =
   | "PUBLIC_TO_EVERYONE"
@@ -85,6 +132,8 @@ export type PublishJob = {
   mode: PublishMode;
   privacyLevel: PrivacyLevel;
   publishId: string | null;
+  /** "api" (Content Posting API) or "session" (cookie-based uploader). */
+  provider: string;
   status: string;
   failReason: string | null;
   publicPostIds: string;

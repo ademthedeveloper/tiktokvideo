@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { enrichVideo } from "@/lib/tiktok";
-import { UpstreamError } from "@/lib/tiktok";
+import { enrichVideo, UpstreamError } from "@/lib/tiktok";
 import type { TikTokVideo } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -13,8 +12,13 @@ export async function POST(request: Request) {
     if (!body.video?.id) {
       return NextResponse.json({ error: "Missing clip payload" }, { status: 400 });
     }
-    const enriched = await enrichVideo(body.video);
-    return NextResponse.json({ video: enriched, enriched: true });
+    const outcome = await enrichVideo(body.video);
+    return NextResponse.json({
+      video: outcome.video,
+      enriched: outcome.enriched,
+      provider: outcome.provider,
+      reason: outcome.reason,
+    });
   } catch (err) {
     const message =
       err instanceof UpstreamError ? err.message : err instanceof Error ? err.message : "failed";
